@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+here="$(cd "$(dirname "$0")/.." && pwd)"
+bin="$here/.murasame/bin/murasame"
+(cd "$here" && go build -o "$bin" ./cmd/murasame) || exit 2
+exec "$bin" "$@"

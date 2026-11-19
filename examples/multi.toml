@@ -1,0 +1,59 @@
+[instance]
+bot_user = "murasame"
+listen = "127.0.0.1:8737"
+webhook_secret_env = "MURASAME_WEBHOOK_SECRET"
+state_dir = "${MURASAME_STATE:-/var/lib/murasame}"
+db = "murasame.sqlite3"
+poll_interval = 60
+max_concurrent_gates = 1
+external_url = ""
+
+[forges.main]
+url = "${MURASAME_FORGEJO_URL:-http://127.0.0.1:3000}"
+token_env = "MURASAME_FORGEJO_TOKEN"
+
+[[repos]]
+repository = "team/app"
+include = "generic.toml"
+
+[repos.repo]
+target = ["main"]
+
+[repos.forgejo]
+reviewers = ["alice", "bob"]
+reviewers_from_permission = ""
+batch_max = 4
+
+[[repos]]
+repository = "team/handbook"
+name = "docs"
+
+[repos.repo]
+target = ["main"]
+batch = true
+pair_check = false
+
+[repos.gates.build]
+command = ["make", "html"]
+timeout = 1800
+retries = 2
+retry_wait = 60
+
+[[repos.conflicts]]
+label = "docs"
+paths = ["**/*.md"]
+strategy = "keep-both"
+
+[[repos.conflicts]]
+label = "search index"
+paths = ["search-index.json"]
+strategy = "command"
+run = ["make", "search-index"]
+
+[[repos.hooks.post_merge]]
+name = "toc"
+run = ["make", "toc"]
+timeout = 300
+
+[repos.forgejo]
+reviewers_from_permission = "write"

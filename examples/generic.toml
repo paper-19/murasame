@@ -1,0 +1,33 @@
+[repo]
+target = ["main", "master"]
+state_dir = "{repo}/.murasame"
+integ = "{state_dir}/integ"
+create_integ = true
+batch = true
+
+[merge]
+no_ff = true
+
+[gates.check]
+command = ["sh", "-c", "${CHECK_COMMAND:-make check}"]
+timeout = 3600
+retries = 1
+retry_wait = 30
+
+[[conflicts]]
+label = "docs"
+paths = ["CHANGELOG.md", "docs/*.md"]
+strategy = "keep-both"
+
+[records]
+enabled = true
+
+[forgejo]
+url = "${MURASAME_FORGEJO_URL:-}"
+owner = "${MURASAME_FORGEJO_OWNER:-}"
+repo = "${MURASAME_FORGEJO_REPO:-}"
+git_remote_url = "${MURASAME_GIT_URL:-}"
+bot_user = "murasame"
+reviewers_from_permission = "write"
+batch_max = 8
+poll_interval = 60
