@@ -37,6 +37,10 @@ go build -o murasame ./cmd/murasame
 Or use the wrapper `bin/murasame`, which rebuilds into `.murasame/bin/` and runs
 the result on every call.
 
+To run the Forgejo service on a server, see
+[`examples/systemd/`](examples/systemd/README.md): prerequisites, an install
+script, and the systemd units.
+
 ## Usage
 
 ```
