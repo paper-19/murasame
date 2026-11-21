@@ -1,0 +1,26 @@
+title: murasame
+description: A merge queue with batching, bisection and one gate.
+remote_theme: just-the-docs/just-the-docs@v0.10.1
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+color_scheme: light
+search_enabled: true
+mermaid:
+  version: "11.4.1"
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+
+aux_links:
+  "Source":
+    - "https://github.com/paper-19/murasame"
+
+footer_content: "murasame is MIT licensed."
+
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor

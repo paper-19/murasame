@@ -2,3 +2,12 @@
 **/testdata/rapid/
 .claude
 .env
+
+# Docs site (Jekyll)
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/.sass-cache/
+docs/.bundle/
+docs/vendor/
+docs/Gemfile.lock
