@@ -644,6 +644,8 @@ func (h *History) Merges(branch string, pr *int, limit int) ([]Merge, error) {
 
 func osPid() int { return os.Getpid() }
 
+func PidAlive(pid int) bool { return pidAlive(pid) }
+
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false

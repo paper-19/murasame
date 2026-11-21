@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"murasame/internal/config"
@@ -120,6 +119,12 @@ func (l *LocalLander) Land(sha string) string {
 	return ""
 }
 
+type RecordOnlyLander struct{}
+
+func (RecordOnlyLander) Precheck() string { return "" }
+
+func (RecordOnlyLander) Land(string) string { return "" }
+
 type PushLander struct {
 	Repo   *gitx.Git
 	Remote string
@@ -203,6 +208,7 @@ type Options struct {
 	GitEnv          map[string]string
 	RepoKey         string
 	ResetStaleInteg bool
+	NoLand          bool
 }
 
 type Engine struct {
@@ -237,6 +243,8 @@ type Engine struct {
 	landed          string
 	integRef        string
 	integRefKnown   bool
+	noLand          bool
+	pin             string
 }
 
 func New(cfg *config.Config, repoDir string, o Options) (e *Engine, err error) {
@@ -262,6 +270,10 @@ func New(cfg *config.Config, repoDir string, o Options) (e *Engine, err error) {
 	if !filepath.IsAbs(integ) {
 		integ = filepath.Join(main, integ)
 	}
+	if o.NoLand {
+		e.noLand = true
+		integ = filepath.Join(sd, fmt.Sprintf("%s%d", noLandPrefix, os.Getpid()))
+	}
 	e.IntegDir = integ
 	e.Integ = gitx.New(integ, o.GitEnv)
 	e.Vars = config.Vars{"repo": main, "state_dir": sd, "integ": integ, "target": e.Target}
@@ -281,6 +293,9 @@ func New(cfg *config.Config, repoDir string, o Options) (e *Engine, err error) {
 	e.Merger = &conflicts.Merger{Cfg: cfg, Hooks: e.Hooks}
 	e.Records = store.NewGateRecords(cfg.Records, e.DB)
 	e.Lander = o.Lander
+	if e.noLand {
+		e.Lander = RecordOnlyLander{}
+	}
 	if e.Lander == nil {
 		e.Lander = &LocalLander{Repo: e.G, Target: e.Target}
 	}
@@ -319,20 +334,21 @@ func (e *Engine) history() (*store.History, error) {
 	return store.NewHistory(r), nil
 }
 
-func (e *Engine) bestEffort(what string, fn func() error) {
-	err := func() (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				if re, ok := r.(error); ok {
-					err = re
-					return
-				}
-				panic(r)
+func tryDB(fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, ok := r.(error); ok {
+				err = re
+				return
 			}
-		}()
-		return fn()
+			panic(r)
+		}
 	}()
-	if err != nil {
+	return fn()
+}
+
+func (e *Engine) bestEffort(what string, fn func() error) {
+	if err := tryDB(fn); err != nil {
 		e.Rep.Say(fmt.Sprintf("-- WARNING: the state DB: %s not recorded: %s", what, err))
 	}
 }
@@ -357,7 +373,7 @@ func (e *Engine) historyBegin(items []Item, mode, args, source string) {
 		if err != nil {
 			return err
 		}
-		e.RunID, err = h.Begin(source, mode, e.Target, e.G.Rev("refs/heads/"+e.Target), args, members)
+		e.RunID, err = h.Begin(source, mode, e.Target, e.G.Rev(e.targetRef()), args, members)
 		return err
 	})
 }
@@ -398,7 +414,14 @@ func (e *Engine) target() string {
 
 func (e *Engine) short(rev string) string { return e.G.Short(rev, 0) }
 
-func (e *Engine) base() string { return e.G.Out("rev-parse", "refs/heads/"+e.Target) }
+func (e *Engine) base() string { return e.G.Out("rev-parse", e.targetRef()) }
+
+func (e *Engine) targetRef() string {
+	if e.pin != "" {
+		return e.pin
+	}
+	return "refs/heads/" + e.Target
+}
 
 func (e *Engine) resetTo(rev string) {
 	if e.integRefKnown {
@@ -458,6 +481,9 @@ func (e *Engine) outcome(item Item, o Outcome) {
 }
 
 func (e *Engine) recordStopped(name, why string) {
+	if e.noLand {
+		return
+	}
 	e.Rep.Record("stopped", name, "branch", name, "reason", why)
 }
 
@@ -472,13 +498,21 @@ func names(items []Item) string {
 func (e *Engine) stop(items []Item, why string) {
 	e.resetInteg()
 	e.Rep.Say("")
-	if len(items) > 0 {
-		e.Rep.Say(fmt.Sprintf("MERGE QUEUE STOPPED at %s: %s", names(items), why))
-	} else {
-		e.Rep.Say("MERGE QUEUE STOPPED: " + why)
+	head := "MERGE QUEUE STOPPED"
+	if e.noLand {
+		head = "NO-LAND RUN STOPPED"
 	}
-	e.Rep.Say(fmt.Sprintf("  integ is reset to %s (%s); %s has every branch merged before it", e.Target,
-		e.short(e.base()), e.Target))
+	if len(items) > 0 {
+		e.Rep.Say(fmt.Sprintf("%s at %s: %s", head, names(items), why))
+	} else {
+		e.Rep.Say(head + ": " + why)
+	}
+	if e.noLand {
+		e.Rep.Say("  no pass was recorded; the target and the integration worktree are untouched")
+	} else {
+		e.Rep.Say(fmt.Sprintf("  integ is reset to %s (%s); %s has every branch merged before it", e.Target,
+			e.short(e.base()), e.Target))
+	}
 	for _, i := range items {
 		e.recordStopped(i.Name, why)
 		e.outcome(i, Outcome{Status: states.OutcomeStopped, Why: why})
@@ -652,7 +686,9 @@ func (e *Engine) finish(code int) *RunResult {
 	if merged == "" {
 		merged = "(none)"
 	}
-	e.Rep.Say("merged: " + merged)
+	if !e.noLand {
+		e.Rep.Say("merged: " + merged)
+	}
 	if len(e.Res.SetAside) > 0 {
 		e.Rep.Say(fmt.Sprintf("set aside: %s (each with its reason in %s: \"stopped branch=<branch> reason=...\")",
 			strings.Join(e.Res.SetAside, " "), e.Rep.Path()))
@@ -672,6 +708,7 @@ type RunOptions struct {
 func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 	os.MkdirAll(e.StateDir, 0o755)
 	e.RunID = o.RunID
+	e.pruneThrowaways()
 	if o.DryRun {
 		defer e.closeDB()
 		defer gitx.Catch(&err)
@@ -679,21 +716,35 @@ func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 		e.historyFinish("")
 		return res, nil
 	}
-	lock := store.NewQueueLock(e.StateDir)
-	wait := e.Cfg.LockWait
-	if o.LockWait != nil {
-		wait = *o.LockWait
-	}
-	if lerr := lock.Acquire(wait, o.Args, e.Rep.Say); lerr != nil {
-		if _, ok := lerr.(*store.LockTimeout); !ok {
+	var lock *store.QueueLock
+	if e.noLand {
+		remove, nerr := e.noLandBegin(items)
+		if nerr != nil {
 			e.closeDB()
-			return e.Res, lerr
+			return e.Res, nerr
 		}
-		fmt.Fprintln(os.Stderr, lerr.Error())
-		e.Res.Code = 1
-		e.historyFinish(lerr.Error())
-		e.closeDB()
-		return e.Res, nil
+		defer remove()
+		if w, ok := e.Events.(Throwaway); ok {
+			w.Throwaway(remove)
+			defer w.Throwaway(nil)
+		}
+	} else {
+		lock = store.NewQueueLock(e.StateDir)
+		wait := e.Cfg.LockWait
+		if o.LockWait != nil {
+			wait = *o.LockWait
+		}
+		if lerr := lock.Acquire(wait, o.Args, e.Rep.Say); lerr != nil {
+			if _, ok := lerr.(*store.LockTimeout); !ok {
+				e.closeDB()
+				return e.Res, lerr
+			}
+			fmt.Fprintln(os.Stderr, lerr.Error())
+			e.Res.Code = 1
+			e.historyFinish(lerr.Error())
+			e.closeDB()
+			return e.Res, nil
+		}
 	}
 	if l, ok := e.Events.(Locker); ok {
 		l.Locked(true)
@@ -729,13 +780,18 @@ func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 			}
 		}
 		e.historyFinish(note)
-		lock.Release()
+		if lock != nil {
+			lock.Release()
+		}
 		e.closeDB()
 	}()
 	if e.RunID == 0 {
 		e.closeAbandonedRuns()
 		mode := "one-by-one"
-		if o.Batch {
+		switch {
+		case e.noLand:
+			mode = "no-land"
+		case o.Batch:
 			mode = "batch"
 		}
 		e.historyBegin(items, mode, o.Args, "cli")
@@ -749,7 +805,7 @@ func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 	}
 	e.resetInteg()
 	e.gateName = e.Gate.Select()
-	return e.runMode(items, o.Batch), nil
+	return e.runMode(items, o.Batch && !e.noLand), nil
 }
 
 func (e *Engine) runMode(items []Item, batch bool) (res *RunResult) {
@@ -828,7 +884,7 @@ func (e *Engine) precheck() string {
 	if why := e.Lander.Precheck(); why != "" {
 		return why
 	}
-	if e.resetStaleInteg && (e.Integ.DirtyTracked() || !e.Integ.IsAncestor("HEAD", "refs/heads/"+t)) {
+	if e.resetStaleInteg && (e.Integ.DirtyTracked() || !e.Integ.IsAncestor("HEAD", e.targetRef())) {
 		e.Rep.Say(fmt.Sprintf("-- %s was left half-built by an interrupted run: reset to %s", e.IntegDir, t))
 		e.resetInteg()
 	}
@@ -845,7 +901,7 @@ func (e *Engine) precheck() string {
 				strings.Join(shown, ", "))
 		}
 	}
-	if !e.Integ.IsAncestor("HEAD", "refs/heads/"+t) {
+	if !e.Integ.IsAncestor("HEAD", e.targetRef()) {
 		return fmt.Sprintf("%s has commits that are not on %s (a merge by hand in progress?): reset it to %s first",
 			e.IntegDir, t, t)
 	}
@@ -887,14 +943,24 @@ func (e *Engine) gate(label string, items []Item, skip bool, what string) *gate.
 	e.integ.Must(states.IntegOnGate)
 	name := e.gateName
 	log := reporter.FreshLog(e.StateDir, time.Now().Format("20060102-150405")+"-"+Safe(label)+".gate")
+	sc := e.scope(name)
 	if skip && e.Records.Enabled() && !e.Regate && !e.Integ.DirtyTracked() {
 		tree := e.Integ.TreeOf("HEAD")
-		found := e.Records.Find(tree, name, e.gateHash(name))
+		accept := []string{e.gateHash(name)}
+		if sc.Affected {
+			accept = append(accept, e.affectedHash(name))
+		}
+		found := e.Records.Find(tree, name, accept...)
 		if found.OK {
-			note := fmt.Sprintf("gate skipped: tree %s passed the %s gate at %s (log: %s)", tree[:12], name, found.When,
-				found.Log)
+			used := gate.Scope{Affected: found.GateHash != e.gateHash(name), Base: sc.Base}
+			which := name
+			if sc.Why != "" {
+				which += " (" + used.Name() + ")"
+			}
+			note := fmt.Sprintf("gate skipped: tree %s passed the %s gate at %s (log: %s)", tree[:12], which,
+				found.When, found.Log)
 			e.Rep.Say("-- " + note)
-			return &gate.Run{Outcome: "pass", Used: name, Log: found.Log, Record: map[string]string{
+			return &gate.Run{Outcome: "pass", Used: name, Log: found.Log, Scope: used, Record: map[string]string{
 				"when": found.When, "log": found.Log, "tree": tree}}
 		}
 		if found.Why != "no record" {
@@ -921,7 +987,7 @@ func (e *Engine) gate(label string, items []Item, skip bool, what string) *gate.
 	}
 	e.Res.Gates++
 	before := gatedState{head: e.Integ.Head(), tree: e.Integ.TreeOf("HEAD"), dirty: e.Integ.DirtyTracked()}
-	gr := e.Gate.Run(name, log)
+	gr := e.Gate.Run(name, log, sc)
 	if gr != nil {
 		if e.gated == nil {
 			e.gated = map[*gate.Run]gatedState{}
@@ -958,21 +1024,32 @@ func (e *Engine) land(gr *gate.Run) string {
 		}
 		if e.Records.Enabled() {
 			tree := e.Integ.TreeOf("HEAD")
-			e.bestEffort("the gate record", func() error {
-				return e.Records.Write(tree, next, gr.Used, e.gateHash(gr.Used), gr.Log)
-			})
+			write := func() error { return e.Records.Write(tree, next, gr.Used, e.scopeHash(gr.Used, gr.Scope), gr.Log) }
+			if !e.noLand {
+				e.bestEffort("the gate record", write)
+			} else if err := tryDB(write); err != nil {
+				return fmt.Sprintf("the pass record could not be written: %s (log: %s)", err, gr.Log)
+			}
 		}
 	}
 	why := e.Lander.Land(next)
 	if why == "" {
 		e.landed = next
 		e.integ.Must(states.IntegOnLand)
+		if gr.Record != nil && !e.noLand && e.Records.Enabled() {
+			e.bestEffort("the reused gate record's landing", func() error {
+				return e.Records.Landed(gr.Record["tree"], gr.Used, next)
+			})
+		}
 	}
 	return why
 }
 
 func (e *Engine) gateFields(gr *gate.Run, secs int) []string {
 	f := []string{"gate", gr.Used, "secs", strconv.Itoa(secs)}
+	if gr.Scope.Affected {
+		f = append(f, "scope", "affected")
+	}
 	if gr.Record != nil {
 		f = append(f, "reused", gr.Record["when"])
 	}
@@ -1020,7 +1097,7 @@ func (e *Engine) oneByOne(items []Item) *RunResult {
 		var in bool
 		e.building(func(why string) { e.stopRest(rest, why) }, func() {
 			if sha = e.G.CommitOf(item.Ref); sha != "" {
-				in = e.G.IsAncestor(sha, "refs/heads/"+e.Target)
+				in = e.G.IsAncestor(sha, e.targetRef())
 			}
 		})
 		if sha == "" {
@@ -1056,7 +1133,11 @@ func (e *Engine) oneByOne(items []Item) *RunResult {
 		}
 		e.integ.Must(states.IntegOnBuilt)
 		g.Must(states.GroupOnBuilt)
-		gr := e.gate(item.Slug, []Item{item}, true, what)
+		label := item.Slug
+		if e.noLand {
+			label = "no-land-" + label
+		}
+		gr := e.gate(label, []Item{item}, true, what)
 		e.gateOutcome(g, gr)
 		switch g.State() {
 		case states.GroupInfra:
@@ -1074,6 +1155,12 @@ func (e *Engine) oneByOne(items []Item) *RunResult {
 			stopHere(why)
 		}
 		g.Must(states.GroupOnLanded)
+		if e.noLand {
+			tree := e.Integ.TreeOf("HEAD")
+			e.resetInteg()
+			e.recorded(item, gr, tree)
+			continue
+		}
 		stale := e.staleTarget()
 		if stale == "" {
 			e.resetInteg()
@@ -1088,6 +1175,23 @@ func (e *Engine) oneByOne(items []Item) *RunResult {
 		}
 	}
 	return e.finish(0)
+}
+
+func (e *Engine) recorded(item Item, gr *gate.Run, tree string) {
+	scope := ""
+	if gr.Scope.Affected {
+		scope = ", affected tests only"
+	}
+	var line string
+	if gr.Record != nil {
+		line = fmt.Sprintf("recorded: tree %s already has a pass record for the %s gate (%s%s; log: %s); not landed",
+			short(tree), gr.Used, gr.Record["when"], scope, gr.Log)
+	} else {
+		line = fmt.Sprintf("recorded: tree %s passed the %s gate%s; not landed (log: %s)", short(tree), gr.Used, scope,
+			gr.Log)
+	}
+	e.Rep.Say("-- " + line)
+	e.outcome(item, Outcome{Status: states.OutcomeRecorded, Line: line, Log: gr.Log})
 }
 
 func (e *Engine) notTried(items []Item) {
@@ -1116,7 +1220,7 @@ func (e *Engine) batch(items []Item) *RunResult {
 		}
 		e.building(stopAll, func() {
 			if item.Sha = e.G.CommitOf(item.Ref); item.Sha != "" {
-				in = e.G.IsAncestor(item.Sha, "refs/heads/"+e.Target)
+				in = e.G.IsAncestor(item.Sha, e.targetRef())
 			}
 		})
 		switch {
@@ -1182,7 +1286,7 @@ func (e *Engine) batchGroup(grp []Item, queue [][]Item) [][]Item {
 		var in bool
 		e.building(stopAll, func() {
 			sha = e.tip(item)
-			in = e.G.IsAncestor(sha, "refs/heads/"+e.Target)
+			in = e.G.IsAncestor(sha, e.targetRef())
 		})
 		if in {
 			e.Rep.Say(fmt.Sprintf("== %s: already in %s: skipped", item.Name, e.Target))
@@ -1315,23 +1419,10 @@ func (e *Engine) staleTarget() string {
 }
 
 func (e *Engine) dryRun(items []Item, batch bool) *RunResult {
-	tmp := filepath.Join(e.StateDir, fmt.Sprintf("dry-%d", os.Getpid()))
-	e.G.MustRun("worktree", "add", "-q", "--detach", tmp, "refs/heads/"+e.Target)
+	tmp := filepath.Join(e.StateDir, fmt.Sprintf("%s%d", dryPrefix, os.Getpid()))
+	remove := e.addThrowaway(tmp, "refs/heads/"+e.Target)
 	t := gitx.New(tmp, e.GitEnv)
-	admin := t.Out("rev-parse", "--path-format=absolute", "--git-dir")
 	status := 0
-	var once sync.Once
-	remove := func() {
-		once.Do(func() {
-			if e.G.OK("worktree", "remove", "--force", tmp) {
-				return
-			}
-			os.RemoveAll(tmp)
-			if admin != "" && filepath.Dir(admin) == filepath.Join(e.G.CommonDir(), "worktrees") {
-				os.RemoveAll(admin)
-			}
-		})
-	}
 	defer remove()
 	if w, ok := e.Events.(Throwaway); ok {
 		w.Throwaway(remove)

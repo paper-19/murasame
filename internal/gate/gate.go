@@ -36,6 +36,20 @@ type Run struct {
 	Log      string
 	InfraWhy string
 	Record   map[string]string
+	Scope    Scope
+}
+
+type Scope struct {
+	Affected bool
+	Base     string
+	Why      string
+}
+
+func (s Scope) Name() string {
+	if s.Affected {
+		return "affected"
+	}
+	return "full"
 }
 
 type Runner struct {
@@ -65,18 +79,22 @@ func (r *Runner) Select() string {
 	return r.Cfg.DefaultGate
 }
 
-func (r *Runner) Once(gate, log string, retried bool) *Attempt {
+func (r *Runner) Once(gate, log string, retried bool, sc Scope) *Attempt {
 	spec := r.Cfg.Gates[gate]
 	rt := "0"
 	if retried {
 		rt = "1"
 	}
-	vars := r.Vars.With("retried", rt, "gate", gate)
+	vars := r.Vars.With("retried", rt, "gate", gate, "base", sc.Base)
 	integ := "."
 	if v, ok := r.Vars["integ"]; ok {
 		integ = v
 	}
-	argv := config.ExpandAll(spec.Command.Args, vars)
+	cmd := spec.Command
+	if sc.Affected {
+		cmd = spec.AffectedCommand
+	}
+	argv := config.ExpandAll(cmd.Args, vars)
 	env := map[string]string{}
 	for k, v := range r.Cfg.GateEnv {
 		env[k] = config.Expand(v, vars)
@@ -145,12 +163,14 @@ func (r *Runner) LogResult(log string) string {
 	}
 	lines := gitx.Lines(strings.ToValidUTF8(string(b), "�"))
 	for i := len(lines) - 1; i >= 0; i-- {
-		if x := strings.TrimSpace(lines[i]); x != "" {
+		if x := strings.TrimSpace(lines[i]); x != "" && !strings.HasPrefix(x, scopeNote) {
 			return x
 		}
 	}
 	return ""
 }
+
+const scopeNote = "-- scope: "
 
 func (r *Runner) wait(secs float64) bool {
 	if r.Poll == nil {
@@ -240,11 +260,11 @@ func (p *Probe) Check() string {
 
 var probeTimeout = 60 * time.Second
 
-func (r *Runner) Run(gate, log string) *Run {
+func (r *Runner) Run(gate, log string, sc Scope) *Run {
 	r.Rep.Say(fmt.Sprintf("-- gate (%s): %s", gate, log))
 	r.cancelled = ""
 	spec := r.Cfg.Gates[gate]
-	run := &Run{Used: gate, Log: log}
+	run := &Run{Used: gate, Log: log, Scope: sc}
 	err := ensureLogDir(filepath.Dir(log))
 	var f *os.File
 	if err == nil {
@@ -257,13 +277,16 @@ func (r *Runner) Run(gate, log string) *Run {
 		return run
 	}
 	f.Close()
+	if sc.Why != "" {
+		r.both(log, fmt.Sprintf("%s%s: %s", scopeNote, sc.Name(), sc.Why))
+	}
 	if why := r.Probe.Check(); why != "" {
 		r.both(log, "-- "+why)
 		run.Outcome, run.InfraWhy = "infra", why
 		return run
 	}
 	for try := 0; ; try++ {
-		att := r.Once(gate, log, run.Retried)
+		att := r.Once(gate, log, run.Retried, sc)
 		if st := att.Status; !st.Clean() {
 			run.Outcome = "infra"
 			run.InfraWhy = fmt.Sprintf("the %s gate left %s (log: %s): stopping "+

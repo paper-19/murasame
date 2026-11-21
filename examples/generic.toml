@@ -13,6 +13,10 @@ command = ["sh", "-c", "${CHECK_COMMAND:-make check}"]
 timeout = 3600
 retries = 1
 retry_wait = 30
+# Only the tests the change can affect (see the README); full runs when these change, and every 20 landings:
+# affected_command = ["make", "check-affected", "BASE={base}"]
+# full_when = ["go.mod", "go.sum", "Makefile"]
+# full_every = 20
 
 [[conflicts]]
 label = "docs"

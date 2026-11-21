@@ -1,2 +1,4 @@
 /.murasame/
 **/testdata/rapid/
+.claude
+.env

@@ -15,6 +15,8 @@ pull-request comments.
   split the batch to isolate the culprit. Or go `--one-by-one`.
 - **Configurable gates.** Several named gates per repository, each with its own
   command, timeout, retries and environment.
+- **Affected tests.** Optionally run only the tests a change can affect, with
+  full runs when chosen paths change and after a number of landings.
 - **Pass records.** A tree that already passed a gate isn't gated again (for a
   configurable time).
 - **Automatic conflict resolution** for selected paths: `keep-both`, `ours`,
@@ -35,7 +37,8 @@ go build -o murasame ./cmd/murasame
 ```
 
 Or use the wrapper `bin/murasame`, which rebuilds into `.murasame/bin/` and runs
-the result on every call.
+the result on every call. It also loads `.env` from the checkout if present:
+copy [`.env.example`](.env.example) to `.env` for local settings and secrets.
 
 To run the Forgejo service on a server, see
 [`examples/systemd/`](examples/systemd/README.md): prerequisites, an install
@@ -70,10 +73,31 @@ murasame run --one-by-one feature-a feature-b
 murasame run --dry-run feature-a            # merge in a throwaway worktree; report only
 murasame run --gate build --regate feature-a
 murasame run --skip-hook toc feature-a
+murasame run --no-land feature-a            # gate and record the pass; never lands
 ```
 
 `--batch` gates all the branches together and bisects on a failure.
 `--one-by-one` gates each branch separately and stops at the first problem.
+
+**Gating ahead of time.** `--no-land` gates one branch the way the queue would,
+and records the pass instead of landing it. It merges the branch onto the
+target, as the target is when the run starts, in a throwaway worktree of its
+own (`{state_dir}/no-land-<pid>`), with the same conflict rules, `post_merge`
+hooks, gate, environment and command prefix. It doesn't take the queue lock, so
+it runs alongside the queue, and several can run at once. It needs
+`[records] enabled = true`.
+
+When the branch is queued later and the target hasn't moved, the queue builds
+the same tree, finds the record and skips the gate. The skip message names the
+`…-no-land-<branch>.gate.log` log, so you can see where the pass came from. If
+the target has moved, or the branch lands in a batch with others, the tree
+differs and the queue gates as usual. To use it with the Forgejo service, run it
+on the server with the service's config, so that the record goes to the
+service's state DB.
+
+No-land gates run at the same time as the queue's gate, on the same machine and
+as the same user. A gate that uses fixed ports, a shared build cache or fixed
+paths outside its worktree can collide with them.
 
 ### History
 
@@ -130,12 +154,36 @@ fields. Which ones are available depends on the field:
 | Where | Placeholders |
 |---|---|
 | everywhere | `{repo}`, `{state_dir}`, `{integ}`, `{target}` |
-| gate commands | plus `{gate}`, `{retried}` |
+| gate commands | plus `{gate}`, `{retried}`, `{base}` |
 | post-merge hooks | plus `{branch}`, `{hook}` |
 | conflict commands | plus `{branch}` |
 | post-land hooks | plus `{hook}`, `{target_sha}`, `{target_short}` |
 
 Write `{{` and `}}` for literal braces.
+
+**Affected tests.** A gate can have a second command that runs only the tests
+the change can affect, chosen by your own build tool:
+
+```toml
+[gates.check]
+command = ["make", "check"]                                   # the full run
+affected_command = ["make", "check-affected", "BASE={base}"]  # only what the change can affect
+full_when = ["go.mod", "go.sum", "Makefile", "ci/**"]         # these changing: the full run
+full_every = 20                       # the full run after 20 affected-tests landings (needs [records])
+```
+
+`{base}` is the commit the branches are merged onto. The gate runs in the
+integration worktree, so `git diff --name-only {base}` lists the change. For
+each tree it gates, a batch or each part of a bisection, murasame runs the full
+`command` when a changed path matches `full_when`, when a `full_every` full run
+is due, or when it cannot tell what changed; otherwise `affected_command`. The
+gate log says which, and why; the merge lines in `merges.log` say
+`scope=affected`. A record of an affected-tests pass does not stand in for a
+full run.
+
+The full runs matter: a dependency graph misses what your build tool cannot see
+(generated code, fixtures, files read at run time), and `{base}` itself may
+have only had its affected tests run.
 
 **Isolation.** Gate, hook and conflict commands run as the murasame user unless
 you set `[repo].command_prefix` (for example, a `sudo -u` or sandbox wrapper).

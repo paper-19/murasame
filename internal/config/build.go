@@ -131,7 +131,30 @@ func build(d map[string]any, path string) (*Config, error) {
 	if err := checkPlaceholders(cfg); err != nil {
 		return nil, err
 	}
+	for _, name := range order {
+		if gs[name].FullEvery > 0 && !records.Enabled {
+			return nil, Errf("gates.%s.full_every: needs [records] enabled = true (the records count the landings)", name)
+		}
+	}
 	return cfg, nil
+}
+
+func affected(spec *GateSpec, m map[string]any) error {
+	what := "gates." + spec.Name
+	if spec.AffectedCommand.Empty() {
+		for _, k := range []string{"full_when", "full_every"} {
+			if _, ok := m[k]; ok {
+				return Errf("%s.%s: only with affected_command", what, k)
+			}
+		}
+		return nil
+	}
+	for _, g := range spec.FullWhen {
+		if err := glob.Check(g); err != nil {
+			return Errf("%s.full_when: bad path pattern %q: %s", what, g, err)
+		}
+	}
+	return nil
 }
 
 func gates(m map[string]map[string]any, timeout int, prefix []string) (map[string]*GateSpec, error) {
@@ -147,6 +170,9 @@ func gates(m map[string]map[string]any, timeout int, prefix []string) (map[strin
 		spec := &GateSpec{Name: name, Env: map[string]string{}, Timeout: timeout, Retries: 1, RetryWait: 30,
 			CommandPrefix: prefix}
 		if err := Decode(m[name], spec, "gates."+name, "command"); err != nil {
+			return nil, err
+		}
+		if err := affected(spec, m[name]); err != nil {
 			return nil, err
 		}
 		out[name] = spec
@@ -242,7 +268,7 @@ func checkName(name, what string, seen map[string]bool) error {
 
 var (
 	baseVars   = []string{"repo", "state_dir", "integ", "target"}
-	gateVars   = append([]string{"gate", "retried"}, baseVars...)
+	gateVars   = append([]string{"gate", "retried", "base"}, baseVars...)
 	mergeVars  = append([]string{"branch", "hook"}, baseVars...)
 	ruleVars   = append([]string{"branch"}, baseVars...)
 	landVars   = append([]string{"hook", "target_sha", "target_short"}, baseVars...)
@@ -282,6 +308,7 @@ func checkPlaceholders(cfg *Config) error {
 	for _, name := range cfg.GateOrder {
 		g := cfg.Gates[name]
 		fields = append(fields, field{"gates." + name + ".command", g.Command.Args, gateVars},
+			field{"gates." + name + ".affected_command", g.AffectedCommand.Args, gateVars},
 			field{"gates." + name + ".env", envValues(g.Env), gateVars})
 	}
 	for i, r := range cfg.Conflicts {

@@ -2,4 +2,6 @@
 here="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$here/.murasame/bin/murasame"
 (cd "$here" && go build -o "$bin" ./cmd/murasame) || exit 2
+# Secrets for local runs (e.g. TYPESAFE_API_KEY): KEY=value lines, sourced as shell, ignored by git.
+if [ -f "$here/.env" ]; then set -a; . "$here/.env"; set +a; fi
 exec "$bin" "$@"

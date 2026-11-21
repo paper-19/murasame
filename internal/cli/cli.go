@@ -32,6 +32,8 @@ func subParser(name string, cfg *config.Config) *parser {
 		p.add(opt{flag: "--batch", dest: "batch", kind: "bool", help: "one gate for all the branches, bisected on a failure"})
 		p.add(opt{flag: "--one-by-one", dest: "batch", kind: "false", help: "one gate per branch; the first problem stops"})
 		p.add(opt{flag: "--dry-run", dest: "dry_run", kind: "bool", help: "merge in a throwaway worktree only; report"})
+		p.add(opt{flag: "--no-land", dest: "no_land", kind: "bool", help: "gate one branch in a throwaway worktree, " +
+			"without the queue lock, and record the pass for the queue to reuse; never lands"})
 		p.add(opt{flag: "--regate", dest: "regate", kind: "bool", help: "gate even a tree with a pass record"})
 		gate := opt{flag: "--gate", dest: "gate", kind: "value", help: "the gate to use (default: the config's default gate)"}
 		if cfg != nil {
@@ -203,6 +205,20 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 		return 0, &usageError{prog: "murasame run", msg: "the following arguments are required: branches",
 			usage: subParser("run", cfg).usage()}
 	}
+	if a.flag("no_land") {
+		fail := func(msg string) error {
+			return &usageError{prog: "murasame run", msg: msg, usage: subParser("run", cfg).usage()}
+		}
+		switch {
+		case a.flag("dry_run"):
+			return 0, fail("argument --no-land: not allowed with argument --dry-run")
+		case len(a.pos) != 1:
+			return 0, fail(fmt.Sprintf("argument --no-land: takes exactly one branch, not %d", len(a.pos)))
+		case !cfg.Records.Enabled:
+			return 0, fail("argument --no-land: needs [records] enabled = true in the config (the pass record is " +
+				"what it is for)")
+		}
+	}
 	skip := map[string]bool{}
 	var hooks []string
 	for _, h := range cfg.PostLand {
@@ -223,7 +239,7 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 	stop := stopOnSignals(it, stderr)
 	defer stop()
 	eng, err := newEngine(cfg, repoDir, engine.Options{Gate: a.str["gate"], SkipHooks: skip, Regate: a.flag("regate"),
-		Events: it})
+		Events: it, NoLand: a.flag("no_land")})
 	if err != nil {
 		fmt.Fprintf(stderr, "murasame: %v\n", err)
 		return 1, nil
@@ -345,6 +361,18 @@ func checkConfig(cfg *config.Config, indent string, header bool, w io.Writer) in
 		gs = append(gs, x+")")
 	}
 	say(fmt.Sprintf("  gates: %s; default %s", strings.Join(gs, ", "), cfg.DefaultGate))
+	for _, name := range cfg.GateOrder {
+		g := cfg.Gates[name]
+		if g.AffectedCommand.Empty() {
+			continue
+		}
+		x := fmt.Sprintf("  gate %s, affected tests only: %s; full run when %d pattern(s) change", name,
+			strings.Join(g.AffectedCommand.Args, " "), len(g.FullWhen))
+		if g.FullEvery > 0 {
+			x += fmt.Sprintf(", and after %d affected-tests landing(s)", g.FullEvery)
+		}
+		say(x)
+	}
 	pair := "off"
 	if cfg.PairCheck {
 		pair = "on"

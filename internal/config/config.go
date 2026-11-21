@@ -78,7 +78,7 @@ func placeholderField(path []string) bool {
 	case "gate":
 		return path[1] == "env"
 	case "gates":
-		return len(path) >= 3 && (path[2] == "command" || path[2] == "env")
+		return len(path) >= 3 && (path[2] == "command" || path[2] == "affected_command" || path[2] == "env")
 	case "conflicts":
 		return path[1] == "run" || path[1] == "env"
 	case "hooks":
@@ -203,13 +203,16 @@ type Cmd struct {
 func (c Cmd) Empty() bool { return c.Args == nil }
 
 type GateSpec struct {
-	Name          string            `mapstructure:"-"`
-	Command       Cmd               `mapstructure:"command"`
-	Env           map[string]string `mapstructure:"env"`
-	Timeout       int               `mapstructure:"timeout"`
-	Retries       int               `mapstructure:"retries"`
-	RetryWait     int               `mapstructure:"retry_wait"`
-	CommandPrefix []string          `mapstructure:"-"`
+	Name            string            `mapstructure:"-"`
+	Command         Cmd               `mapstructure:"command"`
+	Env             map[string]string `mapstructure:"env"`
+	Timeout         int               `mapstructure:"timeout"`
+	Retries         int               `mapstructure:"retries"`
+	RetryWait       int               `mapstructure:"retry_wait"`
+	CommandPrefix   []string          `mapstructure:"-"`
+	AffectedCommand Cmd               `mapstructure:"affected_command"`
+	FullWhen        []string          `mapstructure:"full_when"`
+	FullEvery       int               `mapstructure:"full_every"`
 }
 
 func strsJSON(xs []string) any {
@@ -232,8 +235,21 @@ func strMapJSON(m map[string]string) map[string]any {
 }
 
 func (g *GateSpec) ConfigHash(commonEnv map[string]string) string {
-	top := map[string]any{"name": g.Name, "command": g.Command.Args, "env": strMapJSON(g.Env),
+	return hashJSON(g.hashFields(commonEnv))
+}
+
+func (g *GateSpec) AffectedHash(commonEnv map[string]string) string {
+	top := g.hashFields(commonEnv)
+	top["scope"], top["affected_command"] = "affected", g.AffectedCommand.Args
+	return hashJSON(top)
+}
+
+func (g *GateSpec) hashFields(commonEnv map[string]string) map[string]any {
+	return map[string]any{"name": g.Name, "command": g.Command.Args, "env": strMapJSON(g.Env),
 		"common_env": strMapJSON(commonEnv), "command_prefix": strsJSON(g.CommandPrefix)}
+}
+
+func hashJSON(top map[string]any) string {
 	blob, _ := json.Marshal(top)
 	sum := sha256.Sum256(blob)
 	return hex.EncodeToString(sum[:])[:16]
