@@ -2,6 +2,7 @@ package forgejo
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,6 +61,15 @@ type Comment struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+type CommitStatus struct {
+	ID          int64  `json:"id"`
+	Context     string `json:"context"`
+	State       string `json:"status"`
+	TargetURL   string `json:"target_url"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at"`
+}
+
 type API interface {
 	OpenPulls() ([]Pull, error)
 	Pull(number int) (Pull, error)
@@ -68,6 +78,7 @@ type API interface {
 	Comment(number int, body string) error
 	Status(sha, state, context, description, targetURL string) error
 	Permission(user string) (string, error)
+	Statuses(sha string) ([]CommitStatus, error)
 }
 
 type Client struct {
@@ -239,4 +250,73 @@ func (c *Client) Permission(user string) (string, error) {
 		p = "none"
 	}
 	return p, nil
+}
+
+func (c *Client) Statuses(sha string) ([]CommitStatus, error) {
+	return pages[CommitStatus](c, c.r()+"/commits/"+url.PathEscape(sha)+"/statuses", nil)
+}
+
+type Repository struct {
+	FullName      string `json:"full_name"`
+	HasActions    *bool  `json:"has_actions"`
+	DefaultBranch string `json:"default_branch"`
+}
+
+type Entry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Type string `json:"type"`
+}
+
+type BranchProtection struct {
+	RuleName   string `json:"rule_name"`
+	BranchName string `json:"branch_name"`
+}
+
+func (c *Client) Repository() (Repository, error) {
+	var r Repository
+	err := c.Call("GET", c.r(), nil, &r, nil)
+	return r, err
+}
+
+func (c *Client) Dir(path, ref string) ([]Entry, error) {
+	var out []Entry
+	err := c.Call("GET", c.r()+"/contents/"+path, nil, &out, url.Values{"ref": {ref}})
+	return out, err
+}
+
+func (c *Client) File(path, ref string) (string, error) {
+	var f struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := c.Call("GET", c.r()+"/contents/"+path, nil, &f, url.Values{"ref": {ref}}); err != nil {
+		return "", err
+	}
+	if f.Encoding != "base64" {
+		return f.Content, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(f.Content)
+	if err != nil {
+		return "", &Error{"GET", c.r() + "/contents/" + path, 200, "bad base64: " + err.Error()}
+	}
+	return string(b), nil
+}
+
+func (c *Client) BranchProtections() ([]BranchProtection, error) {
+	var out []BranchProtection
+	err := c.Call("GET", c.r()+"/branch_protections", nil, &out, nil)
+	return out, err
+}
+
+func (c *Client) BranchHead(branch string) (string, error) {
+	var out []struct {
+		Sha string `json:"sha"`
+	}
+	err := c.Call("GET", c.r()+"/commits", nil, &out, url.Values{"sha": {branch}, "limit": {"1"}, "stat": {"false"},
+		"verification": {"false"}, "files": {"false"}})
+	if err != nil || len(out) == 0 {
+		return "", err
+	}
+	return out[0].Sha, nil
 }

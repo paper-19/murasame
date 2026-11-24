@@ -6,44 +6,38 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"slices"
-	"sort"
 	"strings"
+	"sync"
+	"syscall"
 
 	"murasame/internal/config"
-	"murasame/internal/engine"
 	"murasame/internal/instance"
 	"murasame/internal/server"
 	"murasame/internal/status"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
-var newEngine = engine.New
+var commandNames = []string{"serve", "tick", "check-config", "history"}
 
-var commandNames = []string{"run", "serve", "tick", "check-config", "history"}
+var brokenPipes sync.Once
 
-func subParser(name string, cfg *config.Config) *parser {
+func surviveBrokenPipes() {
+	brokenPipes.Do(func() {
+		signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
+	})
+}
+
+func subParser(name string) *parser {
 	p := &parser{prog: "murasame " + name}
 	p.add(opt{flag: "--config", dest: "config", kind: "value", help: "the project config (TOML); default $MURASAME_CONFIG"})
 	p.add(opt{flag: "--repo", dest: "repo", kind: "value", help: "the repository (any checkout or worktree of it; " +
 		"the service: its bare clone); default .; a multi-repo config names its own"})
-	if name == "run" {
-		p.add(opt{flag: "--batch", dest: "batch", kind: "bool", help: "one gate for all the branches, bisected on a failure"})
-		p.add(opt{flag: "--one-by-one", dest: "batch", kind: "false", help: "one gate per branch; the first problem stops"})
-		p.add(opt{flag: "--dry-run", dest: "dry_run", kind: "bool", help: "merge in a throwaway worktree only; report"})
-		p.add(opt{flag: "--no-land", dest: "no_land", kind: "bool", help: "gate one branch in a throwaway worktree, " +
-			"without the queue lock, and record the pass for the queue to reuse; never lands"})
-		p.add(opt{flag: "--regate", dest: "regate", kind: "bool", help: "gate even a tree with a pass record"})
-		gate := opt{flag: "--gate", dest: "gate", kind: "value", help: "the gate to use (default: the config's default gate)"}
-		if cfg != nil {
-			gate.choice = append([]string{}, cfg.GateOrder...)
-			sort.Strings(gate.choice)
-			gate.help = "the gate to use (default: " + cfg.DefaultGate + ")"
-		}
-		p.add(gate)
-		p.add(opt{flag: "--skip-hook", dest: "skip_hook", kind: "append", meta: "NAME", help: "don't run this post-land hook"})
-		p.posName, p.posHelp = "branches", "the branches, in merge order"
+	if name == "check-config" {
+		p.add(opt{flag: "--forge", dest: "forge", kind: "bool", help: "also check the forge with the bot's token: " +
+			"Actions, the bot's permission, a workflow on the staging branch, protection rules"})
 	}
 	if name == "serve" {
 		p.add(opt{flag: "--once", dest: "once", kind: "bool", help: "one cycle, then exit"})
@@ -62,7 +56,7 @@ func subParser(name string, cfg *config.Config) *parser {
 	return p
 }
 
-const topUsage = "usage: murasame [-h] [--version] {run,serve,tick,check-config,history} ..."
+const topUsage = "usage: murasame [-h] [--version] {serve,tick,check-config,history} ..."
 
 func Main(argv []string, stdout, stderr io.Writer) int {
 	surviveBrokenPipes()
@@ -80,7 +74,7 @@ func Main(argv []string, stdout, stderr io.Writer) int {
 		} else if ue.prog != "murasame" {
 			for _, n := range commandNames {
 				if ue.prog == "murasame "+n {
-					usage = subParser(n, nil).usage()
+					usage = subParser(n).usage()
 				}
 			}
 		}
@@ -102,8 +96,8 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 			return 0, nil
 		}
 		if a == "-h" || a == "--help" {
-			fmt.Fprintln(stdout, topUsage+"\n\nA merge queue: batches, bisection, one gate.\n\npositional arguments:\n"+
-				"  {run,serve,tick,check-config,history}\n    run                 merge branches through the gate\n"+
+			fmt.Fprintln(stdout, topUsage+"\n\nA merge queue for Forgejo: batches, bisection, Forgejo Actions as the gate."+
+				"\n\npositional arguments:\n  {serve,tick,check-config,history}\n"+
 				"    serve               the Forgejo service\n    tick                one Forgejo service cycle\n"+
 				"    check-config        load and show the config\n    history             recent merges and batches (read-only)")
 			return 0, nil
@@ -119,17 +113,18 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 	}
 	name := argv[cmdAt]
 	if !slices.Contains(commandNames, name) {
-		return 0, &usageError{prog: "murasame", msg: fmt.Sprintf("argument command: invalid choice: '%s' (choose from 'run', "+
-			"'serve', 'tick', 'check-config', 'history')", name)}
+		msg := fmt.Sprintf("argument command: invalid choice: '%s' (choose from 'serve', 'tick', 'check-config', "+
+			"'history')", name)
+		return 0, &usageError{prog: "murasame", msg: msg}
 	}
 	rest := argv[cmdAt+1:]
-	known, err := subParser(name, nil).parse(rest, true)
+	known, err := subParser(name).parse(rest, true)
 	var help *helpRequest
 	if err != nil && !errors.As(err, &help) {
 		return 0, err
 	}
 	if help != nil {
-		known, _ = subParser(name, nil).parse(withoutHelp(rest), true)
+		known, _ = subParser(name).parse(withoutHelp(rest), true)
 	}
 	cfgPath := os.Getenv("MURASAME_CONFIG")
 	repoDir := "."
@@ -158,15 +153,11 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 		if help != nil {
 			return 0, help
 		}
-		if name == "run" {
-			return 0, config.Errf("%s is a multi-repo service config: `run` takes a project config (e.g. the file a "+
-				"[[repos]] entry includes)", cfgPath)
-		}
 		spec, err := instance.Load(cfgPath, nil, nil, "")
 		if err != nil {
 			return 0, err
 		}
-		a, err := subParser(name, nil).parse(rest, false)
+		a, err := subParser(name).parse(rest, false)
 		if err != nil {
 			return 0, err
 		}
@@ -182,16 +173,20 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 		}
 		return 0, err
 	}
-	a, err := subParser(name, cfg).parse(rest, false)
+	a, err := subParser(name).parse(rest, false)
 	if err != nil {
 		return 0, err
 	}
-	if name != "run" && len(a.pos) > 0 {
+	if len(a.pos) > 0 {
 		return 0, &usageError{prog: "murasame " + name, msg: "unrecognized arguments: " + strings.Join(a.pos, " ")}
 	}
 	switch name {
 	case "check-config":
-		return checkConfig(cfg, "", true, stdout), nil
+		code := checkConfig(cfg, "", true, stdout)
+		if a.flag("forge") && !checkForge(cfg, "", stdout) {
+			code = 1
+		}
+		return code, nil
 	case "history":
 		return History(cfg, historyArgs(a, repoDir), "", nil, stdout, stderr), nil
 	case "serve", "tick":
@@ -199,71 +194,12 @@ func run(argv []string, stdout, stderr io.Writer) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		if name == "serve" && !a.flag("once") {
+			go startupChecks(spec, stdout)
+		}
 		return server.Serve(spec, name == "tick" || a.flag("once")), nil
 	}
-	if len(a.pos) == 0 {
-		return 0, &usageError{prog: "murasame run", msg: "the following arguments are required: branches",
-			usage: subParser("run", cfg).usage()}
-	}
-	if a.flag("no_land") {
-		fail := func(msg string) error {
-			return &usageError{prog: "murasame run", msg: msg, usage: subParser("run", cfg).usage()}
-		}
-		switch {
-		case a.flag("dry_run"):
-			return 0, fail("argument --no-land: not allowed with argument --dry-run")
-		case len(a.pos) != 1:
-			return 0, fail(fmt.Sprintf("argument --no-land: takes exactly one branch, not %d", len(a.pos)))
-		case !cfg.Records.Enabled:
-			return 0, fail("argument --no-land: needs [records] enabled = true in the config (the pass record is " +
-				"what it is for)")
-		}
-	}
-	skip := map[string]bool{}
-	var hooks []string
-	for _, h := range cfg.PostLand {
-		hooks = append(hooks, h.Name)
-	}
-	for _, h := range a.lists["skip_hook"] {
-		if !slices.Contains(hooks, h) {
-			known := "none are configured"
-			if len(hooks) > 0 {
-				known = "choose from " + strings.Join(hooks, ", ")
-			}
-			return 0, &usageError{prog: "murasame run", msg: fmt.Sprintf("argument --skip-hook: no post-land hook %q (%s)", h,
-				known), usage: subParser("run", cfg).usage()}
-		}
-		skip[h] = true
-	}
-	it := newInterruption(a.flag("dry_run"))
-	stop := stopOnSignals(it, stderr)
-	defer stop()
-	eng, err := newEngine(cfg, repoDir, engine.Options{Gate: a.str["gate"], SkipHooks: skip, Regate: a.flag("regate"),
-		Events: it, NoLand: a.flag("no_land")})
-	if err != nil {
-		fmt.Fprintf(stderr, "murasame: %v\n", err)
-		return 1, nil
-	}
-	batch := cfg.DefaultBatch
-	if b := a.bools["batch"]; b != nil {
-		batch = *b
-	}
-	items := make([]engine.Item, len(a.pos))
-	for i, b := range a.pos {
-		ref := ""
-		if !strings.HasPrefix(b, "refs/") && eng.G.OK("show-ref", "--verify", "-q", "refs/heads/"+b) {
-			ref = "refs/heads/" + b
-		}
-		items[i] = engine.NewItem(b, ref, "", "")
-	}
-	it.Begin(eng.Target)
-	res, err := eng.Run(items, engine.RunOptions{Batch: batch, DryRun: a.flag("dry_run"), Args: strings.Join(argv, " ")})
-	stop()
-	if err != nil {
-		fmt.Fprintf(stderr, "murasame: %v\n", err)
-		return 1, nil
-	}
-	return res.Code, nil
+	return 0, nil
 }
 
 func withoutHelp(args []string) []string {
@@ -301,13 +237,21 @@ func atoi(s string) int {
 func instanceCommand(spec *instance.Spec, name string, a *parsed, repoDir string, stdout, stderr io.Writer) int {
 	switch name {
 	case "serve", "tick":
+		if name == "serve" && !a.flag("once") {
+			go startupChecks(spec, stdout)
+		}
 		return server.Serve(spec, name == "tick" || a.flag("once"))
 	case "history":
 		return History(spec.Repos[0].Cfg, historyArgs(a, repoDir), spec.DB, instanceKeys(spec), stdout, stderr)
 	}
-	fmt.Fprintf(stdout, "config %s: ok (multi-repo: %d repositories)\n", spec.Path, len(spec.Repos))
-	fmt.Fprintf(stdout, "  instance: bot %s; listen %s; poll every %d s; at most %d gate(s) at once; state DB %s\n",
-		spec.BotUser, spec.Listen, spec.PollInterval, spec.MaxConcurrentGates, spec.DB)
+	code := 0
+	repos := "repositories"
+	if len(spec.Repos) == 1 {
+		repos = "repository"
+	}
+	fmt.Fprintf(stdout, "config %s: ok (multi-repo: %d %s)\n", spec.Path, len(spec.Repos), repos)
+	fmt.Fprintf(stdout, "  instance: bot %s; listen %s; poll every %d s; state DB %s\n",
+		spec.BotUser, spec.Listen, spec.PollInterval, spec.DB)
 	for _, n := range spec.ForgeOrder {
 		f := spec.Forges[n]
 		fmt.Fprintf(stdout, "  forge %s: %s (token $%s)\n", f.Name, shownURL(f.URL), f.TokenEnv)
@@ -316,8 +260,11 @@ func instanceCommand(spec *instance.Spec, name string, a *parsed, repoDir string
 		fmt.Fprintf(stdout, "repo %s: %s/%s on %s, clone %s\n", e.Name, e.Cfg.Forgejo.Owner, e.Cfg.Forgejo.Repo,
 			shownURL(e.Cfg.Forgejo.URL), e.Clone)
 		checkConfig(e.Cfg, "  ", false, stdout)
+		if a.flag("forge") && !checkForge(e.Cfg, "  ", stdout) {
+			code = 1
+		}
 	}
-	return 0
+	return code
 }
 
 func shownURL(raw string) string {
@@ -351,57 +298,27 @@ func checkConfig(cfg *config.Config, indent string, header bool, w io.Writer) in
 	}
 	say(fmt.Sprintf("  target: %s; integ: %s; state: %s; state DB: %s%s", strings.Join(cfg.Target, " or "), cfg.Integ,
 		cfg.StateDir, cfg.DB, key))
-	var gs []string
-	for _, name := range cfg.GateOrder {
-		g := cfg.Gates[name]
-		x := fmt.Sprintf("%s (timeout %d s, retries %d", name, g.Timeout, g.Retries)
-		if g.Retries > 0 {
-			x += fmt.Sprintf(" %d s apart", g.RetryWait)
-		}
-		gs = append(gs, x+")")
+	ci := cfg.CI
+	contexts := "every job of the run"
+	if len(ci.Contexts) > 0 {
+		contexts = strings.Join(ci.Contexts, ", ")
 	}
-	say(fmt.Sprintf("  gates: %s; default %s", strings.Join(gs, ", "), cfg.DefaultGate))
-	for _, name := range cfg.GateOrder {
-		g := cfg.Gates[name]
-		if g.AffectedCommand.Empty() {
-			continue
-		}
-		x := fmt.Sprintf("  gate %s, affected tests only: %s; full run when %d pattern(s) change", name,
-			strings.Join(g.AffectedCommand.Args, " "), len(g.FullWhen))
-		if g.FullEvery > 0 {
-			x += fmt.Sprintf(", and after %d affected-tests landing(s)", g.FullEvery)
-		}
-		say(x)
+	start := ""
+	if ci.StartTimeout > 0 {
+		start = fmt.Sprintf("; no status after %d s: infrastructure failure", ci.StartTimeout)
 	}
+	say(fmt.Sprintf("  CI: pushes to %s, then waits for %s (timeout %d s%s; checked every %d s)", ci.Staging, contexts,
+		ci.Timeout, start, ci.PollInterval))
 	pair := "off"
 	if cfg.PairCheck {
 		pair = "on"
 	}
 	say(fmt.Sprintf("  pair check: %s", pair))
-	if len(cfg.CommandPrefix) > 0 {
-		say("  project commands run through: " + strings.Join(cfg.CommandPrefix, " "))
-	} else {
-		say("  project commands run as this user (no command_prefix: they can read this process's secrets)")
-	}
 	for _, r := range cfg.Conflicts {
-		x := fmt.Sprintf("  conflicts %s: %s -> %s", r.Label, strings.Join(r.Paths, " "), r.Strategy)
-		if r.Strategy == "command" {
-			x += fmt.Sprintf(" (take %s, then run: %s <paths>)", r.Take, strings.Join(r.Run.Args, " "))
-		}
-		say(x)
-	}
-	for _, h := range cfg.PostMerge {
-		say(fmt.Sprintf("  post-merge hook %s: %s", h.Name, strings.Join(h.Run.Args, " ")))
-	}
-	for _, h := range cfg.PostLand {
-		x := fmt.Sprintf("  post-land hook %s: %s", h.Name, strings.Join(h.Run.Args, " "))
-		if h.Dir != "" {
-			x += " (in " + h.Dir + ")"
-		}
-		say(x)
+		say(fmt.Sprintf("  conflicts %s: %s -> %s", r.Label, strings.Join(r.Paths, " "), r.Strategy))
 	}
 	if cfg.Records.Enabled {
-		say(fmt.Sprintf("  records: a tree that passed a gate is not gated again for %d s", cfg.Records.MaxAge))
+		say(fmt.Sprintf("  records: a tree that passed CI is not sent to CI again for %d s", cfg.Records.MaxAge))
 	} else {
 		say("  records: off")
 	}

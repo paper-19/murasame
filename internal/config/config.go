@@ -72,19 +72,7 @@ func placeholderField(path []string) bool {
 	if len(path) < 2 {
 		return false
 	}
-	switch path[0] {
-	case "repo":
-		return len(path) == 2 && slices.Contains([]string{"state_dir", "integ", "db", "key", "command_prefix"}, path[1])
-	case "gate":
-		return path[1] == "env"
-	case "gates":
-		return len(path) >= 3 && (path[2] == "command" || path[2] == "affected_command" || path[2] == "env")
-	case "conflicts":
-		return path[1] == "run" || path[1] == "env"
-	case "hooks":
-		return len(path) >= 3 && (path[2] == "run" || path[2] == "env" || path[1] == "post_land" && path[2] == "dir")
-	}
-	return false
+	return path[0] == "repo" && len(path) == 2 && slices.Contains([]string{"state_dir", "integ", "db", "key"}, path[1])
 }
 
 func Literal(s string) string {
@@ -162,17 +150,6 @@ func defaultEnd(s string, from int) int {
 
 type Vars map[string]string
 
-func (v Vars) With(kv ...string) Vars {
-	out := make(Vars, len(v)+len(kv)/2)
-	for k, x := range v {
-		out[k] = x
-	}
-	for i := 0; i+1 < len(kv); i += 2 {
-		out[kv[i]] = kv[i+1]
-	}
-	return out
-}
-
 func Expand(s string, v Vars) string {
 	return phRE.ReplaceAllStringFunc(s, func(m string) string {
 		switch m {
@@ -188,65 +165,22 @@ func Expand(s string, v Vars) string {
 	})
 }
 
-func ExpandAll(args []string, v Vars) []string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		out[i] = Expand(a, v)
-	}
-	return out
+type CISpec struct {
+	Staging      string   `mapstructure:"staging"`
+	Contexts     []string `mapstructure:"contexts"`
+	Timeout      int      `mapstructure:"timeout"`
+	StartTimeout int      `mapstructure:"start_timeout"`
+	PollInterval int      `mapstructure:"poll_interval"`
 }
 
-type Cmd struct {
-	Args []string
-}
-
-func (c Cmd) Empty() bool { return c.Args == nil }
-
-type GateSpec struct {
-	Name            string            `mapstructure:"-"`
-	Command         Cmd               `mapstructure:"command"`
-	Env             map[string]string `mapstructure:"env"`
-	Timeout         int               `mapstructure:"timeout"`
-	Retries         int               `mapstructure:"retries"`
-	RetryWait       int               `mapstructure:"retry_wait"`
-	CommandPrefix   []string          `mapstructure:"-"`
-	AffectedCommand Cmd               `mapstructure:"affected_command"`
-	FullWhen        []string          `mapstructure:"full_when"`
-	FullEvery       int               `mapstructure:"full_every"`
-}
-
-func strsJSON(xs []string) any {
-	if xs == nil {
-		return nil
-	}
-	out := make([]any, len(xs))
-	for i, x := range xs {
+func (c CISpec) Hash() string {
+	contexts := append([]string{}, c.Contexts...)
+	slices.Sort(contexts)
+	out := make([]any, len(contexts))
+	for i, x := range contexts {
 		out[i] = x
 	}
-	return out
-}
-
-func strMapJSON(m map[string]string) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
-
-func (g *GateSpec) ConfigHash(commonEnv map[string]string) string {
-	return hashJSON(g.hashFields(commonEnv))
-}
-
-func (g *GateSpec) AffectedHash(commonEnv map[string]string) string {
-	top := g.hashFields(commonEnv)
-	top["scope"], top["affected_command"] = "affected", g.AffectedCommand.Args
-	return hashJSON(top)
-}
-
-func (g *GateSpec) hashFields(commonEnv map[string]string) map[string]any {
-	return map[string]any{"name": g.Name, "command": g.Command.Args, "env": strMapJSON(g.Env),
-		"common_env": strMapJSON(commonEnv), "command_prefix": strsJSON(g.CommandPrefix)}
+	return hashJSON(map[string]any{"gate": "ci", "contexts": out})
 }
 
 func hashJSON(top map[string]any) string {
@@ -256,33 +190,13 @@ func hashJSON(top map[string]any) string {
 }
 
 type ConflictRule struct {
-	Label    string            `mapstructure:"label"`
-	Paths    []string          `mapstructure:"paths"`
-	Strategy string            `mapstructure:"strategy"`
-	Exclude  []string          `mapstructure:"exclude"`
-	Run      Cmd               `mapstructure:"run"`
-	Take     string            `mapstructure:"take"`
-	Env      map[string]string `mapstructure:"env"`
-	Timeout  int               `mapstructure:"timeout"`
+	Label    string   `mapstructure:"label"`
+	Paths    []string `mapstructure:"paths"`
+	Strategy string   `mapstructure:"strategy"`
+	Exclude  []string `mapstructure:"exclude"`
 }
 
-var Strategies = []string{"keep-both", "ours", "theirs", "command", "stop"}
-
-type PostMergeHook struct {
-	Name    string            `mapstructure:"name"`
-	Run     Cmd               `mapstructure:"run"`
-	Env     map[string]string `mapstructure:"env"`
-	Timeout int               `mapstructure:"timeout"`
-}
-
-type PostLandHook struct {
-	Name     string            `mapstructure:"name"`
-	Run      Cmd               `mapstructure:"run"`
-	Dir      string            `mapstructure:"dir"`
-	Checkout bool              `mapstructure:"checkout"`
-	Env      map[string]string `mapstructure:"env"`
-	Timeout  int               `mapstructure:"timeout"`
-}
+var Strategies = []string{"keep-both", "ours", "theirs", "stop"}
 
 type RecordsSpec struct {
 	Enabled bool `mapstructure:"enabled"`
@@ -315,27 +229,18 @@ type ForgejoSpec struct {
 }
 
 type Config struct {
-	Path          string
-	Target        []string
-	Integ         string
-	StateDir      string
-	DB            string
-	RepoKey       string
-	CreateInteg   bool
-	LockWait      int
-	DefaultBatch  bool
-	PairCheck     bool
-	Gates         map[string]*GateSpec
-	GateOrder     []string
-	DefaultGate   string
-	GateEnv       map[string]string
-	Conflicts     []*ConflictRule
-	NoFF          bool
-	PostMerge     []*PostMergeHook
-	PostLand      []*PostLandHook
-	Records       RecordsSpec
-	Forgejo       ForgejoSpec
-	CommandPrefix []string
+	Path      string
+	Target    []string
+	Integ     string
+	StateDir  string
+	DB        string
+	RepoKey   string
+	PairCheck bool
+	CI        CISpec
+	Conflicts []*ConflictRule
+	NoFF      bool
+	Records   RecordsSpec
+	Forgejo   ForgejoSpec
 }
 
 func (c *Config) Copy() *Config {
@@ -343,7 +248,7 @@ func (c *Config) Copy() *Config {
 	return &cp
 }
 
-var ProjectTables = []string{"repo", "gate", "gates", "conflicts", "hooks", "records", "forgejo", "merge"}
+var ProjectTables = []string{"repo", "ci", "conflicts", "records", "forgejo", "merge"}
 
 func ReadTOML(path string, text *string) (map[string]any, error) {
 	var data []byte

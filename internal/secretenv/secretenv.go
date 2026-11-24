@@ -41,14 +41,6 @@ func Inherited() map[string]string {
 	return full
 }
 
-func ChildEnv(extra map[string]string) []string {
-	full := Inherited()
-	for k, v := range extra {
-		full[k] = v
-	}
-	return List(full)
-}
-
 func List(env map[string]string) []string {
 	out := make([]string, 0, len(env))
 	for k, v := range env {

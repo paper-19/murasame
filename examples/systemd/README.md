@@ -24,10 +24,9 @@ murasame polls Forgejo every 60 seconds, so you don't need a webhook.
 - Linux with systemd, `git` and `curl`.
 - A network path to Forgejo's HTTP address. murasame talks to the API and pushes over
   HTTP with the token.
-- **The tools your gates need, installed system-wide.** Gates run as the `murasame`
-  user, and the unit hides `/home` (`ProtectHome=yes`), so a toolchain under someone's
-  home directory isn't visible. For a Go repository, for example: `apt install golang-go`.
-  An older Go downloads the toolchain that `go.mod` asks for by itself.
+- **Forgejo Actions with a runner** for each repository you queue. murasame runs no
+  project commands: it pushes merged results to a staging branch and waits for the
+  workflow's commit statuses. See [`../forgejo-workflow.yml`](../forgejo-workflow.yml).
 
 ### A murasame binary
 
@@ -70,17 +69,20 @@ The script:
 1. Creates the `murasame` user and gives it a git identity for merge commits.
 2. Installs the binary.
 3. On the first run, asks for the repository (`owner/name`) and who may approve, writes
-   the config, and opens it in `$EDITOR`. Set the gate command there, for example:
+   the config, and opens it in `$EDITOR`. Set the CI statuses that must pass there, for
+   example:
 
    ```toml
-   [repos.gates.check]
-   command = ["sh", "-c", "go vet ./... && go build ./..."]
+   [repos.ci]
+   contexts = ["ci / check (push)"]
    ```
 
 4. On the first run, asks for the token and checks that it signs in as `murasame`.
 5. Installs and starts the units, then checks `/healthz` and the status page.
 
-Rerun it with a new binary to upgrade. It keeps the config and the token.
+Rerun it with a new binary to upgrade. It keeps the config and the token, and checks
+the config with the new binary first: if the new version rejects it, it stops before
+changing anything.
 
 ## Status page
 
@@ -118,14 +120,15 @@ the config. The script only writes the config on the first run.
   - **Push:** restricted to an allowlist containing only `murasame`.
   - **Merge:** allowlist only `murasame`. This hides the merge button from everyone else.
   - **Approvals:** leave at 0. Approval is the `@murasame approve <sha>` comment.
+- **Settings → Repository → Pull requests:** enable "marking pull requests as manually
+  merged", so murasame can mark the PRs it lands as merged.
 - **Try it:** comment `@murasame ping` on a pull request. The reply comes within a minute.
 
 ## Security notes
 
-- **Gates run as `murasame`**, the same user that holds the token, so gate commands can
-  read it. murasame warns about this at startup. That's fine for repositories whose code
-  you trust. Otherwise set `[repos.repo] command_prefix` to run gates as another user or
-  in a container.
+- **murasame runs no repository code.** The code runs on your Actions runners. A push to
+  the staging branch runs the workflow with the repository's Actions secrets, so a
+  reviewer's approval is what lets a PR's code run with them.
 - The token and the state directory are readable only by root and `murasame`.
 
 ## Removing it

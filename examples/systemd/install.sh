@@ -36,6 +36,10 @@ command -v git >/dev/null || { echo "Needs git."; exit 1; }
 curl -fs -m 5 -o /dev/null "$FORGEJO_URL/api/healthz" || { echo "Forgejo doesn't answer on $FORGEJO_URL."; exit 1; }
 "$NEW" --version
 cd /
+if [[ -e $CONF ]] && ! "$NEW" check-config --config "$CONF" >/dev/null; then
+  echo "The new binary rejects $CONF (see above). Fix it (sudoedit $CONF), then rerun: nothing was changed."
+  exit 1
+fi
 
 echo
 echo "== $USER_NAME system user"
@@ -79,21 +83,23 @@ $external
 url = "$FORGEJO_URL"
 token_env = "MURASAME_FORGEJO_TOKEN"
 
-# One [[repos]] block per repository. Its gate runs in the merged tree; exit 0 = pass.
+# One [[repos]] block per repository. Its gate is Forgejo Actions: murasame pushes the merged
+# result to the staging branch and waits for these commit statuses (examples/forgejo-workflow.yml).
 [[repos]]
 repository = "$repo"
 
 [repos.repo]
 target = ["main"]
 
-[repos.gates.check]
-command = ["make", "check"]
+[repos.ci]
+staging = "murasame/staging"
+contexts = ["ci / check (push)"]
 timeout = 3600
 
 [repos.forgejo]
 reviewers = [$list]
 EOF
-  echo "Opening it so you can set the gate command (and the target branch, if not main)."
+  echo "Opening it so you can set the CI contexts (and the target branch, if not main)."
   read -rp "Press Enter to edit. "
   "${EDITOR:-vi}" "$CONF"
 fi
@@ -141,12 +147,11 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN serve --config $CONF
 Restart=always
 RestartSec=10
-# A running gate gets time to stop.
+# A batch waiting on CI gets time to stop.
 TimeoutStopSec=60
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
-# Gates can't see /home: install their toolchains system-wide (or drop this line).
 ProtectHome=yes
 
 [Install]

@@ -7,7 +7,8 @@ nav_order: 9
 {: .no_toc }
 
 One `murasame serve` can run queues for many repositories on one or more forges.
-They share a SQLite database and a limit on concurrent gates.
+They share a SQLite database. Each repository's gate is its own Forgejo
+Actions workflow, so the runners decide how many run at once.
 
 1. TOC
 {:toc}
@@ -17,7 +18,6 @@ They share a SQLite database and a limit on concurrent gates.
 ```toml
 [instance]
 state_dir = "${MURASAME_STATE:-/var/lib/murasame}"
-max_concurrent_gates = 1
 
 [forges.main]
 url = "${MURASAME_FORGEJO_URL:-http://127.0.0.1:3000}"
@@ -37,15 +37,13 @@ repository = "team/handbook"
 name = "docs"
 
 [repos.repo]
-batch = true
 pair_check = false
 
-[repos.gates.build]
-command = ["make", "html"]
+[repos.ci]
+contexts = ["docs / build (push)"]
 ```
 
-Multi-repo configs work with `serve`, `tick`, `check-config` and `history`. For
-`run`, use the included project config.
+Multi-repo configs work with `serve`, `tick`, `check-config` and `history`.
 
 ## [instance]
 
@@ -57,7 +55,6 @@ Multi-repo configs work with `serve`, `tick`, `check-config` and `history`. For
 | `listen` | `"127.0.0.1:8737"` | HTTP address. |
 | `webhook_secret_env` | `"MURASAME_WEBHOOK_SECRET"` | Env var for the webhook secret. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `max_concurrent_gates` | `1` | Gate limit across all repositories. |
 | `external_url` | `""` | Public status page URL. |
 
 ## [forges.&lt;name&gt;]
@@ -79,8 +76,7 @@ Multi-repo configs work with `serve`, `tick`, `check-config` and `history`. For
 | `git_url` | `<forge git_url>/<owner>/<name>.git` | Fetch and push URL. |
 | `include` | none | Project config to start from, relative to this file. |
 
-Project tables (`repo`, `gates`, `conflicts`, `hooks`, `records`, `forgejo`
-and so on) can also go inline as `[repos.<table>]`. They are merged over the
+Project tables (`repo`, `ci`, `conflicts`, `records`, `forgejo` and `merge`) can also go inline as `[repos.<table>]`. They are merged over the
 included file key by key; an inline array such as `[[repos.conflicts]]`
 replaces the included one.
 

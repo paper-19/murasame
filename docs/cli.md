@@ -7,7 +7,7 @@ nav_order: 4
 {: .no_toc }
 
 ```text
-murasame [-h] [--version] {run,serve,tick,check-config,history} ...
+murasame [-h] [--version] {serve,tick,check-config,history} ...
 ```
 
 1. TOC
@@ -18,51 +18,45 @@ murasame [-h] [--version] {run,serve,tick,check-config,history} ...
 | Option | Meaning |
 |---|---|
 | `--config FILE` | The config. Default `$MURASAME_CONFIG`; one of them is required. |
-| `--repo DIR` | Any checkout or worktree of the repository (the bare clone, for the service). Default `.`. Ignored with a multi-repo config. |
-| `-h` | Help. With a config, `run -h` lists the gate names. |
-
-Options accept unambiguous prefixes (`--one` for `--one-by-one`) and both
-`--gate=build` and `--gate build`.
+| `--repo DIR` | The service's bare clone. Default `.`. Ignored with a multi-repo config. |
+| `-h` | Help. |
 
 | Exit code | Meaning |
 |---|---|
-| 0 | Success. For `run`: everything landed or was already in the target. |
-| 1 | `run` set something aside, stopped, timed out on the lock, or hit an error. |
-| 2 | Usage or config error; nothing ran. |
+| 0 | Success. |
+| 1 | A service cycle failed, `tick` or `serve --once` was stopped by a signal, `serve` stopped at once on a second signal, or `serve` could not listen. |
+| 2 | Usage or config error, a service that could not be set up, or a state DB that `history` could not read; nothing ran. |
 
-## run
+## serve and tick
 
-```text
-murasame run [--batch | --one-by-one] [--dry-run | --no-land] [--regate]
-             [--gate NAME] [--skip-hook NAME]... BRANCH [BRANCH ...]
-```
+`serve` runs the [Forgejo service](forgejo.html). `serve --once` and `tick` both
+run a single cycle and exit, which suits cron or testing a config.
 
-| Option | Meaning |
-|---|---|
-| `BRANCH` | Branches in merge order: names or full refs (`refs/remotes/origin/x`). |
-| `--batch` | One gate for all branches, bisected on failure. |
-| `--one-by-one` | One gate per branch; the first problem stops the run. |
-| `--dry-run` | Merge in a throwaway worktree and report. No gate, no landing. |
-| `--no-land` | Gate one branch and record the pass without landing. See [Gating ahead](gates.html#gating-ahead---no-land). |
-| `--regate` | Gate even if a pass record exists. |
-| `--gate NAME` | Use this gate instead of the default. |
-| `--skip-hook NAME` | Skip this post-land hook. Repeatable. |
-
-Without `--batch` or `--one-by-one`, `[repo] batch` decides. Duplicate branches
-merge once. `run` needs a project config; for one repository of a multi-repo
-instance, use the file its `[[repos]]` entry includes.
-
-The first Ctrl-C (or SIGTERM) stops the running gate, resets `integ` and exits.
-A second one exits at once and may leave the gate running.
+The first SIGINT or SIGTERM stops a batch that is waiting on CI and puts its
+PRs back in the queue. A second one exits at once; the CI run on the staging
+branch may still finish, but nothing lands.
 
 ## check-config
 
-Validates the config and prints what it means: target, gates, conflict rules,
-hooks, records, Forgejo settings and who can approve. Errors name the key:
+Validates the config and prints what it means: target, CI, conflict rules,
+records, Forgejo settings and who can approve. Errors name the key.
+
+`check-config --forge` also asks the forge, with the bot's token, and exits 1
+on a problem that would stop the queue:
 
 ```text
-murasame: gates.check.command: a list of strings like ["make", "check"], not the string "make check" (for a shell line write ["sh", "-c", "make check"])
+  forge ok   the bot's token reads team/app
+  forge ok   @murasame has write permission
+  forge ok   .forgejo/workflows/ci.yml mention(s) murasame/staging
+  forge ok   the jobs on murasame/staging (5242465e0715) are not stuck waiting for a runner
+  forge skip the branch protection rules need admin access to read: whether one covers murasame/staging is not checked
 ```
+
+It checks that Actions are enabled, that the bot can write, that a workflow on
+the target branch mentions the staging branch, and that each context in
+`ci.contexts` names an existing workflow. It warns when the jobs on the staging
+branch have waited more than 10 minutes to start, which usually means no
+runner with the workflow's `runs-on` label is online.
 
 ## history
 
@@ -77,19 +71,6 @@ Read-only view of past runs from the state database.
 | `--json` | JSON output. |
 | `--repo-key KEY` | Which repository in a shared DB (`all` for every one). |
 | `--repos` | List the repositories in the DB. |
-
-```console
-$ murasame history --limit 1
-run 1 (cli, batch) 2026-11-21 09:14:45 .. 09:14:47: main c3d110f28b7b -> 9f8da37c26fb, 3 gate run(s), exit 1
-  merged       feat-a
-  merged       feat-b
-  set_aside    feat-bad: the gate failed (check; log: .murasame/20261121-091446-feat-bad-alone.gate.log)
-```
-
-## serve and tick
-
-`serve` runs the [Forgejo service](forgejo.html). `serve --once` and `tick` both
-run a single cycle and exit, which suits cron or testing a config.
 
 ## Environment
 

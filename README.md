@@ -1,32 +1,32 @@
 # murasame
 
-A merge queue: batches, bisection, one gate.
+A merge queue for Forgejo: batches, bisection, Forgejo Actions as the gate.
 
-murasame lands branches on a target branch only after the merged result passes
-a **gate** (any command you choose, such as `make check`). It can test many
-branches together in one batch and, when a batch fails, bisect it to find the
-branch at fault. It runs either as a local CLI or as a bot for
+murasame lands pull requests on a target branch only after the merged result
+passes CI. It merges the approved PRs onto the target, pushes the result to a
+staging branch, and waits for the commit statuses your Forgejo Actions workflow
+reports on it. If CI passes, it pushes that exact commit to the target. If CI
+fails, it bisects the batch to find the PR at fault. It runs as a bot for
 [Forgejo](https://forgejo.org) (and Gitea-compatible) repositories, driven by
 pull-request comments.
 
+murasame only queues: it runs no project commands. Your runners do the
+building and testing, with the toolchains, caches and secrets they already
+have.
+
 ## Features
 
-- **Batching and bisection.** Gate all queued branches at once; on a failure,
-  split the batch to isolate the culprit. Or go `--one-by-one`.
-- **Configurable gates.** Several named gates per repository, each with its own
-  command, timeout, retries and environment.
-- **Affected tests.** Optionally run only the tests a change can affect, with
-  full runs when chosen paths change and after a number of landings.
-- **Pass records.** A tree that already passed a gate isn't gated again (for a
+- **Batching and bisection.** Gate all queued PRs at once; on a failure, split
+  the batch to isolate the culprit.
+- **Forgejo Actions as the gate.** Each merged result is pushed to a staging
+  branch; the required commit statuses decide.
+- **Pass records.** A tree that already passed CI isn't sent to CI again (for a
   configurable time).
-- **Automatic conflict resolution** for selected paths: `keep-both`, `ours`,
-  `theirs`, or regenerate the file with a `command`.
-- **Hooks.** `post_merge` hooks run on each merge in the integration branch;
-  `post_land` hooks run after the target moves.
+- **Automatic conflict resolution** for selected paths: `keep-both`, `ours` or
+  `theirs`.
 - **Forgejo service.** Webhooks plus polling, commit statuses, comment commands,
   priorities, rollup control, and an HTML/JSON status page.
-- **Multi-repo instances** with a shared SQLite state database and a limit on
-  concurrent gates.
+- **Multi-repo instances** with a shared SQLite state database.
 
 ## Install
 
@@ -40,75 +40,54 @@ Or use the wrapper `bin/murasame`, which rebuilds into `.murasame/bin/` and runs
 the result on every call. It also loads `.env` from the checkout if present:
 copy [`.env.example`](.env.example) to `.env` for local settings and secrets.
 
-To run the Forgejo service on a server, see
+To run the service on a server, see
 [`examples/systemd/`](examples/systemd/README.md): prerequisites, an install
 script, and the systemd units.
 
 ## Usage
 
 ```
-murasame [-h] [--version] {run,serve,tick,check-config,history} ...
+murasame [-h] [--version] {serve,tick,check-config,history} ...
 ```
 
 | Command | What it does |
 |---|---|
-| `run BRANCH...` | Merge the branches, in order, through the gate |
 | `serve` | Run the Forgejo service (`--once` for one cycle) |
 | `tick` | Run one Forgejo service cycle |
-| `check-config` | Load the config and print what it means |
+| `check-config` | Load the config and print what it means (`--forge`: also check the repository, token and workflow on the forge) |
 | `history` | Recent merges and batches (read-only) |
 
 Every command takes `--config FILE` (default `$MURASAME_CONFIG`) and
-`--repo DIR` (any checkout or worktree; default `.`). Run
+`--repo DIR` (the service's bare clone; default `.`). Run
 `murasame COMMAND -h` for the full option list.
-
-### Local runs
-
-```sh
-export MURASAME_CONFIG=examples/generic.toml
-
-murasame check-config
-murasame run feature-a feature-b            # batch or not, per [repo].batch
-murasame run --one-by-one feature-a feature-b
-murasame run --dry-run feature-a            # merge in a throwaway worktree; report only
-murasame run --gate build --regate feature-a
-murasame run --skip-hook toc feature-a
-murasame run --no-land feature-a            # gate and record the pass; never lands
-```
-
-`--batch` gates all the branches together and bisects on a failure.
-`--one-by-one` gates each branch separately and stops at the first problem.
-
-**Gating ahead of time.** `--no-land` gates one branch the way the queue would,
-and records the pass instead of landing it. It merges the branch onto the
-target, as the target is when the run starts, in a throwaway worktree of its
-own (`{state_dir}/no-land-<pid>`), with the same conflict rules, `post_merge`
-hooks, gate, environment and command prefix. It doesn't take the queue lock, so
-it runs alongside the queue, and several can run at once. It needs
-`[records] enabled = true`.
-
-When the branch is queued later and the target hasn't moved, the queue builds
-the same tree, finds the record and skips the gate. The skip message names the
-`…-no-land-<branch>.gate.log` log, so you can see where the pass came from. If
-the target has moved, or the branch lands in a batch with others, the tree
-differs and the queue gates as usual. To use it with the Forgejo service, run it
-on the server with the service's config, so that the record goes to the
-service's state DB.
-
-No-land gates run at the same time as the queue's gate, on the same machine and
-as the same user. A gate that uses fixed ports, a shared build cache or fixed
-paths outside its worktree can collide with them.
-
-### History
 
 ```sh
 murasame history                    # last 20 runs
-murasame history --branch feature-a
 murasame history --pr 42            # also the PR's state changes
 murasame history --log              # merges.log lines instead of runs
 murasame history --json --limit 100
-murasame history --repos            # repositories in the state DB
 ```
+
+## Setting up CI
+
+1. Add a workflow that runs on pushes to the staging branch. See
+   [`examples/forgejo-workflow.yml`](examples/forgejo-workflow.yml):
+
+   ```yaml
+   on:
+     push:
+       branches: [murasame/staging]
+   ```
+
+2. List the jobs that must pass in `[ci] contexts`. Forgejo names each job's
+   status `<workflow> / <job> (push)`, for example `ci / check (push)`. With
+   no contexts, every job of the run must finish without failing.
+3. Let the bot user push to the staging branch (it needs write access to the
+   repository anyway), and keep the staging branch unprotected.
+
+A push to the staging branch runs with the repository's Actions secrets. Only
+approved PRs get there, so a reviewer's approval is what lets code run with
+those secrets.
 
 ## Configuration
 
@@ -120,91 +99,43 @@ multi-repo instance.
 [repo]
 target = ["main", "master"]       # the target branch: main or master
 state_dir = "{repo}/.murasame"
-integ = "{state_dir}/integ"       # the integration branch
-create_integ = true
-batch = true
+integ = "{state_dir}/integ"       # the integration worktree
 
 [merge]
 no_ff = true
 
-[gates.check]
-command = ["sh", "-c", "${CHECK_COMMAND:-make check}"]
-timeout = 3600
-retries = 1
-retry_wait = 30
+[ci]
+staging = "murasame/staging"      # the branch murasame pushes merged results to
+contexts = ["ci / check (push)"]  # the statuses that must pass ([]: all of them)
+timeout = 3600                    # no result after this: infrastructure failure
+start_timeout = 900               # no status at all after this: infrastructure failure
+poll_interval = 15
 
 [[conflicts]]
 label = "docs"
 paths = ["CHANGELOG.md", "docs/*.md"]
-strategy = "keep-both"            # keep-both | ours | theirs | command
-
-[[hooks.post_merge]]
-name = "toc"
-run = ["make", "toc"]
-timeout = 300
+strategy = "keep-both"            # keep-both | ours | theirs | stop
 
 [records]
 enabled = true
-```
 
-**Substitution.** `${VAR}` and `${VAR:-default}` read the environment when the
-config is loaded. `{name}` placeholders are filled in at run time in some
-fields. Which ones are available depends on the field:
-
-| Where | Placeholders |
-|---|---|
-| everywhere | `{repo}`, `{state_dir}`, `{integ}`, `{target}` |
-| gate commands | plus `{gate}`, `{retried}`, `{base}` |
-| post-merge hooks | plus `{branch}`, `{hook}` |
-| conflict commands | plus `{branch}` |
-| post-land hooks | plus `{hook}`, `{target_sha}`, `{target_short}` |
-
-Write `{{` and `}}` for literal braces.
-
-**Affected tests.** A gate can have a second command that runs only the tests
-the change can affect, chosen by your own build tool:
-
-```toml
-[gates.check]
-command = ["make", "check"]                                   # the full run
-affected_command = ["make", "check-affected", "BASE={base}"]  # only what the change can affect
-full_when = ["go.mod", "go.sum", "Makefile", "ci/**"]         # these changing: the full run
-full_every = 20                       # the full run after 20 affected-tests landings (needs [records])
-```
-
-`{base}` is the commit the branches are merged onto. The gate runs in the
-integration worktree, so `git diff --name-only {base}` lists the change. For
-each tree it gates, a batch or each part of a bisection, murasame runs the full
-`command` when a changed path matches `full_when`, when a `full_every` full run
-is due, or when it cannot tell what changed; otherwise `affected_command`. The
-gate log says which, and why; the merge lines in `merges.log` say
-`scope=affected`. A record of an affected-tests pass does not stand in for a
-full run.
-
-The full runs matter: a dependency graph misses what your build tool cannot see
-(generated code, fixtures, files read at run time), and `{base}` itself may
-have only had its affected tests run.
-
-**Isolation.** Gate, hook and conflict commands run as the murasame user unless
-you set `[repo].command_prefix` (for example, a `sudo -u` or sandbox wrapper).
-Without a prefix they can read the process's secrets; `check-config` warns you
-about this.
-
-## Forgejo service
-
-Add a `[forgejo]` table (single repo) or an `[instance]` with `[forges.*]` and
-`[[repos]]` (multi-repo), then run `murasame serve`.
-
-```toml
 [forgejo]
 url = "https://forge.example.com"
 owner = "team"
 repo = "app"
+git_remote_url = "https://forge.example.com/team/app.git"
 bot_user = "murasame"
 reviewers_from_permission = "write"   # or list them in reviewers = [...]
 batch_max = 8
 poll_interval = 60
 ```
+
+Only statuses of a run started by murasame's push count. A `failure` or
+`error` fails the gate and starts bisection; a required job that was skipped
+never passes it. A cancelled job, a run that never reports, statuses that
+can't be read or a refused push are infrastructure failures: the batch goes
+back in the queue and the queue pauses for `infra_backoff` seconds.
+[`docs/gates.md`](docs/gates.md) has every case.
 
 Environment:
 
@@ -214,28 +145,27 @@ Environment:
 | `MURASAME_FORGEJO_TOKEN` | API token for the bot user (`token_env` to rename) |
 | `MURASAME_WEBHOOK_SECRET` | Webhook HMAC secret (`webhook_secret_env` to rename) |
 
-### Comment commands
+## Comment commands
 
 Reviewers write `@murasame <command>` on a pull request:
 
 | Command | Effect |
 |---|---|
-| `approve [SHA]` | Queue the PR (optionally only at this head) |
+| `approve SHA` | Queue the PR at this head (the full 40-character SHA) |
 | `unapprove` | Take it out of the queue |
 | `retry` | Queue it again after a failure |
 | `cancel` | Stop a running test |
 | `priority N` | Set queue priority (−9999…9999) |
 | `rollup` / `rollup never` | Allow, or forbid, batching it with others |
-| `status` | Report the PR's state |
+| `status` | Report the PR's state (with a link to the CI run while it runs) |
 | `ping` | Check that the bot is listening |
 
-All of these except `status` and `ping` need reviewer permission. The bot
-suggests a fix for a misspelled command.
+All of these except `status` and `ping` need reviewer permission.
 
 PR states: `open` → `queued` → `testing` → `merged`, with `set_aside`, `held`
 and `closed` along the way.
 
-### HTTP endpoints
+## HTTP endpoints
 
 The server listens on `127.0.0.1:8737` by default (`listen`).
 
@@ -244,23 +174,19 @@ The server listens on `127.0.0.1:8737` by default (`listen`).
 | `POST /webhook` | Forgejo/Gitea webhook (signature checked when a secret is set) |
 | `GET /` | Status page (HTML) |
 | `GET /api/status` | Status (JSON) |
-| `GET /repos/NAME/logs/LOG` | A gate log |
+| `GET /repos/NAME/logs/LOG` | A gate log (the CI statuses murasame saw, with links to the runs) |
 | `GET /healthz` | Liveness |
-
-The status page only answers on a loopback host name or the host of
-`external_url`.
 
 ## Project layout
 
 ```
 cmd/murasame/        entry point
-internal/cli/        argument parsing, run/history commands
+internal/cli/        argument parsing, check-config and history
 internal/engine/     merge, batch and bisection logic
-internal/gate/       running gate commands and their logs
+internal/gate/       pushing to the staging branch and reading CI statuses
 internal/conflicts/  automatic conflict resolution
-internal/hooks/      post-merge and post-land hooks
 internal/gitx/       git plumbing
-internal/states/     state machines (PRs, batches, slots, backoff)
+internal/states/     state machines (PRs, batches, backoff)
 internal/service/    Forgejo queue service
 internal/server/     HTTP server, webhooks, status page
 internal/instance/   multi-repo instance config
@@ -268,8 +194,12 @@ internal/forgejo/    Forgejo API client
 internal/commands/   comment command parsing
 internal/config/     TOML config loading and validation
 internal/db/         SQLite state database
-internal/store/      locks, records, on-disk state
+internal/store/      records, on-disk state
+tests/               tests: a fake forge and fake CI around a real git repository
 ```
+
+Run the tests with `go test ./tests/`. `tests/e2e/forgejo.sh` runs murasame
+against a real Forgejo 15 and Actions runner in Docker (about two minutes).
 
 ## License
 

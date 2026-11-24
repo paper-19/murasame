@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"murasame/internal/db"
-	"murasame/internal/instance"
 	"murasame/internal/safefile"
 	"murasame/internal/service"
 	"murasame/internal/states"
@@ -93,6 +92,7 @@ func pending(prs map[string]*store.PR) []*store.PR {
 type GateView struct {
 	Elapsed float64 `json:"elapsed"`
 	LogURL  string  `json:"log_url"`
+	RunURL  string  `json:"run_url"`
 	PRs     []int   `json:"prs"`
 	Since   float64 `json:"since"`
 }
@@ -143,9 +143,8 @@ type RepoView struct {
 }
 
 type Page struct {
-	GateSlots *instance.Snapshot `json:"gate_slots"`
-	Now       float64            `json:"now"`
-	Repos     []RepoView         `json:"repos"`
+	Now   float64    `json:"now"`
+	Repos []RepoView `json:"repos"`
 }
 
 func deref(p *string) string {
@@ -162,7 +161,8 @@ func repoView(svc *service.Service, now float64) RepoView {
 	v := RepoView{Name: svc.Name, Repository: svc.Host + "/" + svc.FJ.Owner + "/" + svc.FJ.Repo, Target: svc.Target(),
 		Phase: live.PhaseText(), LastError: live.LastError, PRs: []PRView{}, Batches: []BatchView{}}
 	if g := live.Gate; g != nil {
-		v.Gate = &GateView{Since: g.Since, Elapsed: now - g.Since, PRs: g.PRs, LogURL: LogLink(svc, g.Log)}
+		v.Gate = &GateView{Since: g.Since, Elapsed: now - g.Since, PRs: g.PRs, LogURL: LogLink(svc, g.Log),
+			RunURL: SafeURL(g.RunURL)}
 	}
 	if until := data.Until(); until > now {
 		v.Backoff = &BackoffView{Until: until, Why: data.BackoffWhy}
@@ -183,14 +183,10 @@ func repoView(svc *service.Service, now float64) RepoView {
 	return v
 }
 
-func View(services []*service.Service, slots *instance.GateSlots) Page {
+func View(services []*service.Service) Page {
 	p := Page{Now: db.Now(), Repos: make([]RepoView, len(services))}
 	for i, s := range services {
 		p.Repos[i] = repoView(s, p.Now)
-	}
-	if slots != nil {
-		snap := slots.Snapshot()
-		p.GateSlots = &snap
 	}
 	return p
 }
@@ -230,7 +226,10 @@ func t(x float64) string {
 func now(r RepoView) string {
 	parts := []string{E(r.Phase)}
 	if g := r.Gate; g != nil {
-		s := fmt.Sprintf("gate running %d s", int(g.Elapsed))
+		s := fmt.Sprintf("CI running %d s", int(g.Elapsed))
+		if g.RunURL != "" {
+			s += " (" + a(g.RunURL, "run") + ")"
+		}
 		if g.LogURL != "" {
 			s += " (" + a(g.LogURL, "log") + ")"
 		}
@@ -247,9 +246,6 @@ func now(r RepoView) string {
 
 func Render(v Page) string {
 	var b strings.Builder
-	if s := v.GateSlots; s != nil {
-		fmt.Fprintf(&b, `<p class="mute">gate slots: %d of %s in use</p>`, len(s.Running), E(s.Max))
-	}
 	for _, r := range v.Repos {
 		fmt.Fprintf(&b, `<h2>%s <span class="mute"><code>%s</code> → %s</span></h2><p>%s</p>`, E(r.Name),
 			E(r.Repository), E(r.Target), now(r))

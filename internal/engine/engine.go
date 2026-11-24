@@ -15,7 +15,6 @@ import (
 	"murasame/internal/db"
 	"murasame/internal/gate"
 	"murasame/internal/gitx"
-	"murasame/internal/hooks"
 	"murasame/internal/panics"
 	"murasame/internal/reporter"
 	"murasame/internal/states"
@@ -67,15 +66,6 @@ type Events interface {
 
 type Poller interface{ Poll() string }
 
-type Locker interface{ Locked(held bool) }
-
-type Throwaway interface{ Throwaway(cleanup func()) }
-
-type Slotter interface {
-	GateSlot(what string) string
-	GateDone()
-}
-
 func AndList(names []string) string {
 	if len(names) == 1 {
 		return names[0]
@@ -84,46 +74,8 @@ func AndList(names []string) string {
 }
 
 type Lander interface {
-	Precheck() string
 	Land(sha string) string
 }
-
-type LocalLander struct {
-	Repo   *gitx.Git
-	Target string
-}
-
-func (l *LocalLander) Precheck() string {
-	if l.Repo.SymbolicHead() != l.Target {
-		return "the main checkout is not on " + l.Target
-	}
-	return ""
-}
-
-func (l *LocalLander) Land(sha string) string {
-	if why := l.Precheck(); why != "" {
-		return why + " any more: refusing to fast-forward it"
-	}
-	if !l.Repo.OK("merge", "--ff-only", "-q", sha) {
-		return l.Target + " could not fast-forward to integ (the main checkout has local changes in the way?)"
-	}
-	now := l.Repo.Rev("refs/heads/" + l.Target)
-	if now != sha {
-		shown := now
-		if shown == "" {
-			shown = "-"
-		}
-		return fmt.Sprintf("%s is at %s after the fast-forward, not at the gated %s (the main checkout changed during it?)",
-			l.Target, short(shown), short(sha))
-	}
-	return ""
-}
-
-type RecordOnlyLander struct{}
-
-func (RecordOnlyLander) Precheck() string { return "" }
-
-func (RecordOnlyLander) Land(string) string { return "" }
 
 type PushLander struct {
 	Repo   *gitx.Git
@@ -133,8 +85,6 @@ type PushLander struct {
 }
 
 func (l *PushLander) Stale() string { return l.stale }
-
-func (l *PushLander) Precheck() string { return "" }
 
 func (l *PushLander) Land(sha string) string {
 	r := l.Repo.AuthRun("push", "-q", l.Remote, sha+":refs/heads/"+l.Target)
@@ -197,9 +147,8 @@ type gatedState struct {
 }
 
 type Options struct {
-	Gate            string
-	SkipHooks       map[string]bool
-	Regate          bool
+	CI              gate.Forge
+	Ignore          string
 	Lander          Lander
 	Events          Events
 	Stream          io.Writer
@@ -208,7 +157,6 @@ type Options struct {
 	GitEnv          map[string]string
 	RepoKey         string
 	ResetStaleInteg bool
-	NoLand          bool
 }
 
 type Engine struct {
@@ -223,11 +171,8 @@ type Engine struct {
 	Vars            config.Vars
 	Rep             *reporter.Reporter
 	Gate            *gate.Runner
-	Hooks           *hooks.Hooks
 	Merger          *conflicts.Merger
 	Records         *store.GateRecords
-	SkipHooks       map[string]bool
-	Regate          bool
 	Lander          Lander
 	Events          Events
 	Res             *RunResult
@@ -236,29 +181,28 @@ type Engine struct {
 	resetStaleInteg bool
 	repo            *db.Repo
 	failedTrees     map[string]*failedTree
-	gateName        string
 	steps           int
 	integ           *states.Tracker[states.IntegState, states.IntegEvent]
 	gated           map[*gate.Run]gatedState
-	landed          string
 	integRef        string
 	integRefKnown   bool
-	noLand          bool
-	pin             string
 }
 
 func New(cfg *config.Config, repoDir string, o Options) (e *Engine, err error) {
 	defer gitx.Catch(&err)
+	if o.CI == nil {
+		return nil, fmt.Errorf("engine: no CI forge given")
+	}
+	if o.Lander == nil {
+		return nil, fmt.Errorf("engine: no lander given")
+	}
 	main := gitx.New(repoDir, o.GitEnv).MainCheckout()
 	e = &Engine{Cfg: cfg, Main: main, G: gitx.New(main, o.GitEnv), GitEnv: map[string]string{}, repoKey: o.RepoKey,
-		resetStaleInteg: o.ResetStaleInteg, SkipHooks: o.SkipHooks, Regate: o.Regate, Events: o.Events,
+		resetStaleInteg: o.ResetStaleInteg, Events: o.Events, Lander: o.Lander,
 		Res: &RunResult{Outcomes: map[string]Outcome{}}, failedTrees: map[string]*failedTree{},
 		integ: states.IntegMachine.Start()}
 	for k, v := range o.GitEnv {
 		e.GitEnv[k] = v
-	}
-	if e.SkipHooks == nil {
-		e.SkipHooks = map[string]bool{}
 	}
 	e.Target = e.target()
 	sd := config.Expand(cfg.StateDir, config.Vars{"repo": main})
@@ -270,35 +214,19 @@ func New(cfg *config.Config, repoDir string, o Options) (e *Engine, err error) {
 	if !filepath.IsAbs(integ) {
 		integ = filepath.Join(main, integ)
 	}
-	if o.NoLand {
-		e.noLand = true
-		integ = filepath.Join(sd, fmt.Sprintf("%s%d", noLandPrefix, os.Getpid()))
-	}
 	e.IntegDir = integ
 	e.Integ = gitx.New(integ, o.GitEnv)
 	e.Vars = config.Vars{"repo": main, "state_dir": sd, "integ": integ, "target": e.Target}
 	e.Rep = reporter.New(sd, o.Stream, o.Sink, e.historyLine)
-	e.Gate = gate.NewRunner(cfg, e.Rep, e.Vars, o.Gate, o.Sleep)
+	e.Gate = gate.NewRunner(cfg.CI, o.CI, e.Rep, o.Ignore, o.Sleep)
 	if p, ok := o.Events.(Poller); ok {
 		e.Gate.Poll = p.Poll
 	}
-	e.Hooks = hooks.New(cfg, e.Rep, e.Vars, sd)
-	e.Hooks.Poll = e.Gate.Poll
-	probeEnv := map[string]string{}
-	for k, v := range cfg.GateEnv {
-		probeEnv[k] = config.Expand(v, e.Vars)
+	if h, ok := o.Events.(interface{ CINow() bool }); ok {
+		e.Gate.Hurry = h.CINow
 	}
-	probe := &gate.Probe{Prefix: config.ExpandAll(cfg.CommandPrefix, e.Vars), Dir: integ, Env: probeEnv, StateDir: sd}
-	e.Gate.Probe, e.Hooks.Probe = probe, probe
-	e.Merger = &conflicts.Merger{Cfg: cfg, Hooks: e.Hooks}
+	e.Merger = &conflicts.Merger{Cfg: cfg}
 	e.Records = store.NewGateRecords(cfg.Records, e.DB)
-	e.Lander = o.Lander
-	if e.noLand {
-		e.Lander = RecordOnlyLander{}
-	}
-	if e.Lander == nil {
-		e.Lander = &LocalLander{Repo: e.G, Target: e.Target}
-	}
 	return e, nil
 }
 
@@ -378,17 +306,6 @@ func (e *Engine) historyBegin(items []Item, mode, args, source string) {
 	})
 }
 
-func (e *Engine) closeAbandonedRuns() {
-	e.bestEffort("closing earlier runs that never finished", func() error {
-		h, err := e.history()
-		if err != nil {
-			return err
-		}
-		_, err = h.InterruptedGone("cli", "interrupted: the murasame run ended before it finished")
-		return err
-	})
-}
-
 func (e *Engine) historyFinish(note string) {
 	rid := e.RunID
 	if rid == 0 {
@@ -416,12 +333,7 @@ func (e *Engine) short(rev string) string { return e.G.Short(rev, 0) }
 
 func (e *Engine) base() string { return e.G.Out("rev-parse", e.targetRef()) }
 
-func (e *Engine) targetRef() string {
-	if e.pin != "" {
-		return e.pin
-	}
-	return "refs/heads/" + e.Target
-}
+func (e *Engine) targetRef() string { return "refs/heads/" + e.Target }
 
 func (e *Engine) resetTo(rev string) {
 	if e.integRefKnown {
@@ -481,9 +393,6 @@ func (e *Engine) outcome(item Item, o Outcome) {
 }
 
 func (e *Engine) recordStopped(name, why string) {
-	if e.noLand {
-		return
-	}
 	e.Rep.Record("stopped", name, "branch", name, "reason", why)
 }
 
@@ -499,20 +408,13 @@ func (e *Engine) stop(items []Item, why string) {
 	e.resetInteg()
 	e.Rep.Say("")
 	head := "MERGE QUEUE STOPPED"
-	if e.noLand {
-		head = "NO-LAND RUN STOPPED"
-	}
 	if len(items) > 0 {
 		e.Rep.Say(fmt.Sprintf("%s at %s: %s", head, names(items), why))
 	} else {
 		e.Rep.Say(head + ": " + why)
 	}
-	if e.noLand {
-		e.Rep.Say("  no pass was recorded; the target and the integration worktree are untouched")
-	} else {
-		e.Rep.Say(fmt.Sprintf("  integ is reset to %s (%s); %s has every branch merged before it", e.Target,
-			e.short(e.base()), e.Target))
-	}
+	e.Rep.Say(fmt.Sprintf("  integ is reset to %s (%s); %s has every branch merged before it", e.Target,
+		e.short(e.base()), e.Target))
 	for _, i := range items {
 		e.recordStopped(i.Name, why)
 		e.outcome(i, Outcome{Status: states.OutcomeStopped, Why: why})
@@ -549,20 +451,6 @@ func mergeWhy(m conflicts.Merge) string {
 		return "merge conflict that needs a person: " + m.Why
 	}
 	return m.Why
-}
-
-func (e *Engine) postMerge(stop func(string), item Item, tip, from string, m conflicts.Merge) conflicts.Merge {
-	var r hooks.Result
-	e.building(stop, func() {
-		r = e.afterMerge(item)
-		if r.OK() {
-			if why := e.lost(item, tip, from); why != "" {
-				r = hooks.Aside(why)
-			}
-		}
-	})
-	m.AfterHooks(r)
-	return m
 }
 
 func (e *Engine) gateOutcome(g *group, gr *gate.Run) {
@@ -607,14 +495,11 @@ func (e *Engine) pairCheck(g *group, item Item, known *failedTree, queue [][]Ite
 		g.Must(states.GroupOnAside)
 		return &pairResult{fmt.Sprintf("on its own on %s %s, it does not build: %s (together with %s, the gate failed; "+
 			"log: %s%s)", e.Target, e.short(known.base), why, AndList(itemNames(partners)), known.log,
-			colon(e.Gate.LogResult(known.log))), nil, known.log}
+			colon(gate.LogResult(known.log))), nil, known.log}
 	}
 	tip := e.tip(item)
 	var m conflicts.Merge
 	e.building(stopRest, func() { m = e.merge(item, tip) })
-	if m.State.Merged() {
-		m = e.postMerge(stopRest, item, tip, known.base, m)
-	}
 	switch m.State {
 	case states.MergeInfra:
 		stopRest(m.Why)
@@ -622,13 +507,12 @@ func (e *Engine) pairCheck(g *group, item Item, known *failedTree, queue [][]Ite
 		return unbuilt(mergeWhy(m))
 	}
 	e.integ.Must(states.IntegOnBuilt)
-	what := "pair check of " + item.Name
 	if solo, failed := e.failedTrees[e.Integ.TreeOf("HEAD")]; failed {
 		g.Must(states.GroupOnAlone)
 		return &pairResult{fmt.Sprintf("the gate failed on its own too (the same tree as an earlier gate run; log: %s)",
-			solo.log) + colon(e.Gate.LogResult(solo.log)), nil, solo.log}
+			solo.log) + colon(gate.LogResult(solo.log)), nil, solo.log}
 	}
-	gr := e.gate(item.Slug+"-alone", []Item{item}, true, what)
+	gr := e.gate(item.Slug+"-alone", []Item{item}, true)
 	delete(e.gated, gr)
 	if gr.Outcome == "cancelled" || gr.Outcome == "infra" {
 		stopRest(gr.InfraWhy)
@@ -639,7 +523,7 @@ func (e *Engine) pairCheck(g *group, item Item, known *failedTree, queue [][]Ite
 		if _, ok := e.failedTrees[tree]; !ok {
 			e.failedTrees[tree] = &failedTree{gr.Log, []Item{item}, known.base}
 		}
-		return &pairResult{fmt.Sprintf("the gate failed (%s; log: %s)", gr.Used, gr.Log) + colon(e.Gate.LogResult(gr.Log)), nil, gr.Log}
+		return &pairResult{fmt.Sprintf("the gate failed (%s; log: %s)", gr.Used, gr.Log) + colon(gate.LogResult(gr.Log)), nil, gr.Log}
 	}
 	g.Must(states.GroupOnTogether)
 	pn := itemNames(partners)
@@ -659,7 +543,7 @@ func (e *Engine) pairCheck(g *group, item Item, known *failedTree, queue [][]Ite
 	}
 	why := fmt.Sprintf("%s fails only when merged together with %s. On its own, it passes. %s merge `%s` into %s, "+
 		"fix the clash, and queue it again. (alone: %s; together: %s%s)", item.Name, AndList(pn), then, e.Target,
-		item.Name, gr.Log, known.log, colon(e.Gate.LogResult(known.log)))
+		item.Name, gr.Log, known.log, colon(gate.LogResult(known.log)))
 	return &pairResult{why, pn, known.log}
 }
 
@@ -671,24 +555,12 @@ func itemNames(items []Item) []string {
 	return out
 }
 
-func (e *Engine) landedAt() string {
-	if e.landed != "" {
-		return e.landed
-	}
-	return "refs/heads/" + e.Target
-}
-
 func (e *Engine) finish(code int) *RunResult {
-	if len(e.Res.Merged) > 0 {
-		e.Hooks.PostLand(e.G, e.landedAt(), e.SkipHooks)
-	}
 	merged := strings.Join(e.Res.Merged, " ")
 	if merged == "" {
 		merged = "(none)"
 	}
-	if !e.noLand {
-		e.Rep.Say("merged: " + merged)
-	}
+	e.Rep.Say("merged: " + merged)
 	if len(e.Res.SetAside) > 0 {
 		e.Rep.Say(fmt.Sprintf("set aside: %s (each with its reason in %s: \"stopped branch=<branch> reason=...\")",
 			strings.Join(e.Res.SetAside, " "), e.Rep.Path()))
@@ -698,58 +570,13 @@ func (e *Engine) finish(code int) *RunResult {
 }
 
 type RunOptions struct {
-	Batch    bool
-	DryRun   bool
-	Args     string
-	LockWait *int
-	RunID    int64
+	Args  string
+	RunID int64
 }
 
 func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 	os.MkdirAll(e.StateDir, 0o755)
 	e.RunID = o.RunID
-	e.pruneThrowaways()
-	if o.DryRun {
-		defer e.closeDB()
-		defer gitx.Catch(&err)
-		res = e.dryRun(items, o.Batch)
-		e.historyFinish("")
-		return res, nil
-	}
-	var lock *store.QueueLock
-	if e.noLand {
-		remove, nerr := e.noLandBegin(items)
-		if nerr != nil {
-			e.closeDB()
-			return e.Res, nerr
-		}
-		defer remove()
-		if w, ok := e.Events.(Throwaway); ok {
-			w.Throwaway(remove)
-			defer w.Throwaway(nil)
-		}
-	} else {
-		lock = store.NewQueueLock(e.StateDir)
-		wait := e.Cfg.LockWait
-		if o.LockWait != nil {
-			wait = *o.LockWait
-		}
-		if lerr := lock.Acquire(wait, o.Args, e.Rep.Say); lerr != nil {
-			if _, ok := lerr.(*store.LockTimeout); !ok {
-				e.closeDB()
-				return e.Res, lerr
-			}
-			fmt.Fprintln(os.Stderr, lerr.Error())
-			e.Res.Code = 1
-			e.historyFinish(lerr.Error())
-			e.closeDB()
-			return e.Res, nil
-		}
-	}
-	if l, ok := e.Events.(Locker); ok {
-		l.Locked(true)
-		defer l.Locked(false)
-	}
 	note := ""
 	defer func() {
 		if r := recover(); r != nil {
@@ -768,47 +595,24 @@ func (e *Engine) Run(items []Item, o RunOptions) (res *RunResult, err error) {
 			if why := e.leaveInteg(true); why != "" {
 				e.Rep.Say(fmt.Sprintf("-- WARNING: integ could not be reset after the error: %s", why))
 			}
-			if len(e.Res.Merged) > 0 {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							e.Rep.Say(fmt.Sprintf("-- WARNING: the post-land hooks could not run after the error: %v", r))
-						}
-					}()
-					e.Hooks.PostLand(e.G, e.landedAt(), e.SkipHooks)
-				}()
-			}
 		}
 		e.historyFinish(note)
-		if lock != nil {
-			lock.Release()
-		}
 		e.closeDB()
 	}()
 	if e.RunID == 0 {
-		e.closeAbandonedRuns()
-		mode := "one-by-one"
-		switch {
-		case e.noLand:
-			mode = "no-land"
-		case o.Batch:
-			mode = "batch"
-		}
-		e.historyBegin(items, mode, o.Args, "cli")
+		e.historyBegin(items, "batch", o.Args, "service")
 	}
 	if why := e.precheck(); why != "" {
-		fmt.Fprintln(os.Stderr, why)
 		note = why
 		e.Res.Code = 1
 		e.Res.Stopped = why
 		return e.Res, nil
 	}
 	e.resetInteg()
-	e.gateName = e.Gate.Select()
-	return e.runMode(items, o.Batch && !e.noLand), nil
+	return e.runBatch(items), nil
 }
 
-func (e *Engine) runMode(items []Item, batch bool) (res *RunResult) {
+func (e *Engine) runBatch(items []Item) (res *RunResult) {
 	defer func() {
 		if r := recover(); r != nil {
 			if _, ok := r.(stopSignal); ok {
@@ -818,10 +622,7 @@ func (e *Engine) runMode(items []Item, batch bool) (res *RunResult) {
 			panic(r)
 		}
 	}()
-	if batch {
-		return e.batch(items)
-	}
-	return e.oneByOne(items)
+	return e.batch(items)
 }
 
 func (e *Engine) building(stop func(string), fn func()) {
@@ -862,9 +663,6 @@ func samePath(a, b string) bool {
 func (e *Engine) precheck() string {
 	t := e.Target
 	if !isDir(e.IntegDir) {
-		if !e.Cfg.CreateInteg {
-			return fmt.Sprintf("no integration tree at %s (git worktree add %s -b integ %s)", e.IntegDir, e.IntegDir, t)
-		}
 		e.G.MustRun("worktree", "add", "-q", "--detach", e.IntegDir, "refs/heads/"+t)
 	}
 	same := false
@@ -881,9 +679,6 @@ func (e *Engine) precheck() string {
 			"(git -C %s switch --detach) or give it a branch of its own", e.IntegDir, t, t, e.IntegDir)
 	}
 	e.integRef, e.integRefKnown = on, true
-	if why := e.Lander.Precheck(); why != "" {
-		return why
-	}
 	if e.resetStaleInteg && (e.Integ.DirtyTracked() || !e.Integ.IsAncestor("HEAD", e.targetRef())) {
 		e.Rep.Say(fmt.Sprintf("-- %s was left half-built by an interrupted run: reset to %s", e.IntegDir, t))
 		e.resetInteg()
@@ -912,19 +707,6 @@ func (e *Engine) merge(item Item, sha string) conflicts.Merge {
 	return e.Merger.Merge(e.Integ, sha, item.Name, item.Slug, item.Message)
 }
 
-func (e *Engine) afterMerge(item Item) hooks.Result {
-	return e.Hooks.PostMerge(e.Integ, item.Name, item.Slug)
-}
-
-func (e *Engine) lost(item Item, tip, from string) string {
-	head := e.Integ.Rev("HEAD")
-	if head != "" && e.Integ.IsAncestor(tip, head) && e.Integ.IsAncestor(from, head) {
-		return ""
-	}
-	return fmt.Sprintf("integ's HEAD %s after merging %s does not contain %s %s or what was merged before it (%s): a "+
-		"conflict command or post-merge hook moved it", short(head), item.Name, item.Name, short(tip), short(from))
-}
-
 func (e *Engine) notLanding(bs []built, sha string) string {
 	for _, b := range bs {
 		if !e.Integ.IsAncestor(b.sha, sha) {
@@ -935,65 +717,45 @@ func (e *Engine) notLanding(bs []built, sha string) string {
 	return ""
 }
 
-func (e *Engine) gateHash(name string) string {
-	return e.Cfg.Gates[name].ConfigHash(e.Cfg.GateEnv)
-}
+func (e *Engine) gateHash() string { return e.Cfg.CI.Hash() }
 
-func (e *Engine) gate(label string, items []Item, skip bool, what string) *gate.Run {
+func (e *Engine) gate(label string, items []Item, skip bool) *gate.Run {
 	e.integ.Must(states.IntegOnGate)
-	name := e.gateName
 	log := reporter.FreshLog(e.StateDir, time.Now().Format("20060102-150405")+"-"+Safe(label)+".gate")
-	sc := e.scope(name)
-	if skip && e.Records.Enabled() && !e.Regate && !e.Integ.DirtyTracked() {
+	if skip && e.Records.Enabled() && !e.Integ.DirtyTracked() {
 		tree := e.Integ.TreeOf("HEAD")
-		accept := []string{e.gateHash(name)}
-		if sc.Affected {
-			accept = append(accept, e.affectedHash(name))
-		}
-		found := e.Records.Find(tree, name, accept...)
+		found := e.Records.Find(tree, gate.Name, e.gateHash())
 		if found.OK {
-			used := gate.Scope{Affected: found.GateHash != e.gateHash(name), Base: sc.Base}
-			which := name
-			if sc.Why != "" {
-				which += " (" + used.Name() + ")"
-			}
-			note := fmt.Sprintf("gate skipped: tree %s passed the %s gate at %s (log: %s)", tree[:12], which,
-				found.When, found.Log)
+			note := fmt.Sprintf("gate skipped: tree %s passed CI at %s (log: %s)", tree[:12], found.When, found.Log)
 			e.Rep.Say("-- " + note)
-			return &gate.Run{Outcome: "pass", Used: name, Log: found.Log, Scope: used, Record: map[string]string{
+			return &gate.Run{Outcome: gate.Pass, Used: gate.Name, Log: found.Log, Record: map[string]string{
 				"when": found.When, "log": found.Log, "tree": tree}}
 		}
 		if found.Why != "no record" {
 			e.Rep.Say(fmt.Sprintf("-- gating: tree %s has no gate record the queue accepts: %s", tree[:12], found.Why))
 		}
 	}
-	slotter, hasSlots := e.Events.(Slotter)
-	if hasSlots {
-		w := what
-		if w == "" {
-			w = label
-		}
-		if why := slotter.GateSlot(w); why != "" {
-			return &gate.Run{Outcome: "cancelled", Used: name, Log: log, InfraWhy: "cancelled: " + why}
-		}
-	}
-	defer func() {
-		if hasSlots {
-			slotter.GateDone()
-		}
-	}()
 	if e.Events != nil {
 		e.Events.Gating(items, log)
 	}
 	e.Res.Gates++
 	before := gatedState{head: e.Integ.Head(), tree: e.Integ.TreeOf("HEAD"), dirty: e.Integ.DirtyTracked()}
-	gr := e.Gate.Run(name, log, sc)
-	if gr != nil {
-		if e.gated == nil {
-			e.gated = map[*gate.Run]gatedState{}
-		}
-		e.gated[gr] = before
+	if before.dirty {
+		return &gate.Run{Outcome: gate.Infra, Used: gate.Name, Log: log, InfraWhy: "integ has uncommitted changes: " +
+			"refusing to send it to CI"}
 	}
+	e.Gate.Seen = nil
+	if c, ok := e.Events.(interface{ CIStarted([]Item, string) }); ok {
+		e.Gate.Seen = func(url string) { c.CIStarted(items, url) }
+	}
+	gr := e.Gate.Run(before.head, log)
+	if d, ok := e.Events.(interface{ GateDone() }); ok {
+		d.GateDone()
+	}
+	if e.gated == nil {
+		e.gated = map[*gate.Run]gatedState{}
+	}
+	e.gated[gr] = before
 	return gr
 }
 
@@ -1024,19 +786,13 @@ func (e *Engine) land(gr *gate.Run) string {
 		}
 		if e.Records.Enabled() {
 			tree := e.Integ.TreeOf("HEAD")
-			write := func() error { return e.Records.Write(tree, next, gr.Used, e.scopeHash(gr.Used, gr.Scope), gr.Log) }
-			if !e.noLand {
-				e.bestEffort("the gate record", write)
-			} else if err := tryDB(write); err != nil {
-				return fmt.Sprintf("the pass record could not be written: %s (log: %s)", err, gr.Log)
-			}
+			e.bestEffort("the gate record", func() error { return e.Records.Write(tree, next, gr.Used, e.gateHash(), gr.Log) })
 		}
 	}
 	why := e.Lander.Land(next)
 	if why == "" {
-		e.landed = next
 		e.integ.Must(states.IntegOnLand)
-		if gr.Record != nil && !e.noLand && e.Records.Enabled() {
+		if gr.Record != nil && e.Records.Enabled() {
 			e.bestEffort("the reused gate record's landing", func() error {
 				return e.Records.Landed(gr.Record["tree"], gr.Used, next)
 			})
@@ -1047,14 +803,8 @@ func (e *Engine) land(gr *gate.Run) string {
 
 func (e *Engine) gateFields(gr *gate.Run, secs int) []string {
 	f := []string{"gate", gr.Used, "secs", strconv.Itoa(secs)}
-	if gr.Scope.Affected {
-		f = append(f, "scope", "affected")
-	}
 	if gr.Record != nil {
 		f = append(f, "reused", gr.Record["when"])
-	}
-	if gr.Retried {
-		f = append(f, "retried", "yes")
 	}
 	return f
 }
@@ -1081,128 +831,6 @@ func unseen(items []Item, seen map[string]bool) []Item {
 		}
 	}
 	return out
-}
-
-func (e *Engine) oneByOne(items []Item) *RunResult {
-	seen := map[string]bool{}
-	for idx, item := range items {
-		if seen[item.Name] {
-			e.Rep.Say(fmt.Sprintf("== %s: given twice: merged once", item.Name))
-			continue
-		}
-		seen[item.Name] = true
-		rest := append([]Item{item}, unseen(items[idx+1:], seen)...)
-		e.Rep.Say("== " + item.Name)
-		var sha string
-		var in bool
-		e.building(func(why string) { e.stopRest(rest, why) }, func() {
-			if sha = e.G.CommitOf(item.Ref); sha != "" {
-				in = e.G.IsAncestor(sha, e.targetRef())
-			}
-		})
-		if sha == "" {
-			e.stopRest(rest, "no such branch")
-		}
-		if in {
-			e.Rep.Say("-- already in " + e.Target + ": skipped")
-			e.outcome(item, Outcome{Status: states.OutcomeSkipped, Why: "already in " + e.Target})
-			continue
-		}
-		t0 := time.Now()
-		from := e.base()
-		old := e.short(from)
-		tip := e.short(sha)
-		g := states.GroupMachine.Start()
-		g.Must(states.GroupOnBuild)
-		e.integ.Must(states.IntegOnBuild)
-		stopHere := func(why string) {
-			g.Must(states.GroupOnStop)
-			e.stopRest(rest, why)
-		}
-		var m conflicts.Merge
-		e.building(stopHere, func() { m = e.merge(item, sha) })
-		if !m.State.Merged() {
-			stopHere(mergeWhy(m))
-		}
-		if m.Note != "" {
-			e.Rep.Say("-- conflicts resolved: " + m.Note)
-		}
-		what := fmt.Sprintf("%s, %d of %d", item.Name, idx+1, len(items))
-		if m = e.postMerge(stopHere, item, sha, from, m); m.State != states.MergeDone {
-			stopHere(m.Why)
-		}
-		e.integ.Must(states.IntegOnBuilt)
-		g.Must(states.GroupOnBuilt)
-		label := item.Slug
-		if e.noLand {
-			label = "no-land-" + label
-		}
-		gr := e.gate(label, []Item{item}, true, what)
-		e.gateOutcome(g, gr)
-		switch g.State() {
-		case states.GroupInfra:
-			stopHere(gr.InfraWhy)
-		case states.GroupFailed:
-			stopHere(fmt.Sprintf("the gate failed (%s; log: %s)", gr.Used, gr.Log) + colon(e.Gate.LogResult(gr.Log)))
-		}
-		g.Must(states.GroupOnLand)
-		landed := e.Integ.Head()
-		b := built{item: item, sha: sha, tip: tip, from: old, to: e.short(landed), note: m.Note}
-		if why := e.notLanding([]built{b}, landed); why != "" {
-			stopHere(why)
-		}
-		if why := e.land(gr); why != "" {
-			stopHere(why)
-		}
-		g.Must(states.GroupOnLanded)
-		if e.noLand {
-			tree := e.Integ.TreeOf("HEAD")
-			e.resetInteg()
-			e.recorded(item, gr, tree)
-			continue
-		}
-		stale := e.staleTarget()
-		if stale == "" {
-			e.resetInteg()
-		}
-		e.Res.Merged = append(e.Res.Merged, item.Name)
-		line := e.mergedLine(b, gr, int(time.Since(t0).Seconds()), 1)
-		e.Rep.Say("-- " + line)
-		e.outcome(item, Outcome{Status: states.OutcomeMerged, Line: line, Log: gr.Log, Sha: landed})
-		if stale != "" {
-			e.notTried(rest[1:])
-			e.stop(nil, stale)
-		}
-	}
-	return e.finish(0)
-}
-
-func (e *Engine) recorded(item Item, gr *gate.Run, tree string) {
-	scope := ""
-	if gr.Scope.Affected {
-		scope = ", affected tests only"
-	}
-	var line string
-	if gr.Record != nil {
-		line = fmt.Sprintf("recorded: tree %s already has a pass record for the %s gate (%s%s; log: %s); not landed",
-			short(tree), gr.Used, gr.Record["when"], scope, gr.Log)
-	} else {
-		line = fmt.Sprintf("recorded: tree %s passed the %s gate%s; not landed (log: %s)", short(tree), gr.Used, scope,
-			gr.Log)
-	}
-	e.Rep.Say("-- " + line)
-	e.outcome(item, Outcome{Status: states.OutcomeRecorded, Line: line, Log: gr.Log})
-}
-
-func (e *Engine) notTried(items []Item) {
-	for _, i := range items {
-		e.settle(i, Outcome{Status: states.OutcomeNotTried})
-	}
-}
-
-func (e *Engine) stopRest(rest []Item, why string) {
-	e.notTried(rest[1:])
-	e.stop(rest[:1], why)
 }
 
 func (e *Engine) batch(items []Item) *RunResult {
@@ -1273,10 +901,6 @@ func (e *Engine) batchGroup(grp []Item, queue [][]Item) [][]Item {
 		e.stop(items, why)
 	}
 	var bs []built
-	what := "batch gate"
-	if e.steps != 0 {
-		what = fmt.Sprintf("bisect step %d", e.steps)
-	}
 	for k, item := range grp {
 		stopAll := func(why string) {
 			all := append(builtItems(bs), grp[k:]...)
@@ -1309,15 +933,6 @@ func (e *Engine) batchGroup(grp []Item, queue [][]Item) [][]Item {
 		if m.Note != "" {
 			e.Rep.Say("-- conflicts resolved: " + m.Note)
 		}
-		m = e.postMerge(stopAll, item, sha, fromSha, m)
-		if m.State == states.MergeInfra {
-			stopAll(m.Why)
-		}
-		if m.State != states.MergeDone {
-			e.resetTo(fromSha)
-			e.setAside(item, m.Why, "", nil)
-			continue
-		}
 		bs = append(bs, built{item: item, sha: sha, tip: e.short(sha), from: from, to: e.Integ.Short("HEAD", 0),
 			note: m.Note})
 	}
@@ -1339,11 +954,11 @@ func (e *Engine) batchGroup(grp []Item, queue [][]Item) [][]Item {
 	var gr *gate.Run
 	if known != nil {
 		e.Rep.Say(fmt.Sprintf("-- this tree failed the gate already (log: %s): not gated again", known.log))
-		gr = &gate.Run{Outcome: "fail", Used: e.gateName, Log: known.log}
+		gr = &gate.Run{Outcome: "fail", Used: gate.Name, Log: known.log}
 		g.Must(states.GroupOnKnown)
 	} else {
 		e.steps++
-		gr = e.gate(label, builtItems(bs), true, what)
+		gr = e.gate(label, builtItems(bs), true)
 		e.gateOutcome(g, gr)
 	}
 	if gr.Outcome != "pass" {
@@ -1356,7 +971,7 @@ func (e *Engine) batchGroup(grp []Item, queue [][]Item) [][]Item {
 		if known == nil {
 			e.failedTrees[tree] = &failedTree{gr.Log, builtItems(bs), e.base()}
 		}
-		result := e.Gate.LogResult(gr.Log)
+		result := gate.LogResult(gr.Log)
 		if n == 1 {
 			var partners []string
 			log := gr.Log
@@ -1416,83 +1031,4 @@ func (e *Engine) staleTarget() string {
 		return s.Stale()
 	}
 	return ""
-}
-
-func (e *Engine) dryRun(items []Item, batch bool) *RunResult {
-	tmp := filepath.Join(e.StateDir, fmt.Sprintf("%s%d", dryPrefix, os.Getpid()))
-	remove := e.addThrowaway(tmp, "refs/heads/"+e.Target)
-	t := gitx.New(tmp, e.GitEnv)
-	status := 0
-	defer remove()
-	if w, ok := e.Events.(Throwaway); ok {
-		w.Throwaway(remove)
-		defer w.Throwaway(nil)
-	}
-	dry := &conflicts.Merger{Cfg: e.Cfg}
-	var after string
-	for _, h := range e.Cfg.PostMerge {
-		after += "; post-merge hook " + h.Name + " would run"
-	}
-	e.Rep.Say(fmt.Sprintf("== dry run on %s %s (a throwaway worktree; nothing else is touched)", e.Target, e.short(e.base())))
-	seen := map[string]bool{}
-	for _, item := range items {
-		if seen[item.Name] {
-			e.Rep.Say(fmt.Sprintf("%s: given twice: checked once", item.Name))
-			continue
-		}
-		seen[item.Name] = true
-		sha := e.G.CommitOf(item.Ref)
-		if sha == "" {
-			if batch {
-				e.Rep.Say(item.Name + ": no such branch: it would be set aside")
-			} else {
-				e.Rep.Say(item.Name + ": no such branch: the queue would stop here")
-			}
-			status = 1
-			e.outcome(item, Outcome{Status: states.OutcomeSetAside, Why: "no such branch"})
-			continue
-		}
-		if e.G.IsAncestor(sha, "refs/heads/"+e.Target) {
-			e.Rep.Say(fmt.Sprintf("%s: already in %s (skipped)", item.Name, e.Target))
-			e.outcome(item, Outcome{Status: states.OutcomeSkipped, Why: "already in " + e.Target})
-			continue
-		}
-		m := dry.Merge(t, sha, item.Name, item.Slug, item.Message)
-		switch m.State {
-		case states.MergeInfra:
-			e.Rep.Say(fmt.Sprintf("%s: %s (not a conflict: the real run would stop here)", item.Name, m.Why))
-			status = 1
-			e.outcome(item, Outcome{Status: states.OutcomeStopped, Why: m.Why})
-			continue
-		case states.MergeAside:
-			e.Rep.Say(fmt.Sprintf("%s: %s", item.Name, m.Why))
-			if batch {
-				e.Rep.Say("   it would be set aside; the branches after it are checked without it")
-			} else {
-				e.Rep.Say("   the queue would stop here; the branches after it are checked as if it were skipped")
-			}
-			status = 1
-			e.outcome(item, Outcome{Status: states.OutcomeSetAside, Why: m.Why})
-			continue
-		case states.MergeNeedsPerson:
-			e.Rep.Say(fmt.Sprintf("%s: CONFLICT that needs a person: %s", item.Name, m.Why))
-			if batch {
-				e.Rep.Say("   it would be set aside; the branches after it are checked without it")
-			} else {
-				e.Rep.Say("   the queue would stop here; the branches after it are checked as if it were skipped")
-			}
-			status = 1
-			e.outcome(item, Outcome{Status: states.OutcomeSetAside, Why: mergeWhy(m)})
-			continue
-		}
-		line := item.Name + ": merges"
-		if m.Note != "" {
-			line += " (resolved: " + m.Note + ")"
-		}
-		line += after
-		e.Rep.Say(line)
-		e.outcome(item, Outcome{Status: states.OutcomeMerged, Line: line})
-	}
-	e.Res.Code = status
-	return e.Res
 }

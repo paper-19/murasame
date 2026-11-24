@@ -23,8 +23,8 @@ import (
 	"murasame/internal/db"
 	"murasame/internal/engine"
 	"murasame/internal/forgejo"
+	"murasame/internal/gate"
 	"murasame/internal/gitx"
-	"murasame/internal/instance"
 	"murasame/internal/panics"
 	"murasame/internal/safefile"
 	"murasame/internal/secretenv"
@@ -68,26 +68,23 @@ type Options struct {
 	Now    func() float64
 	Sleep  func(float64)
 	Name   string
-	Slots  *instance.GateSlots
 }
 
 type Service struct {
-	Cfg      *config.Config
-	FJ       config.ForgejoSpec
-	API      forgejo.API
-	Name     string
-	Host     string
-	Slots    *instance.GateSlots
-	RepoDir  string
-	GitEnv   map[string]string
-	Env      config.Env
-	Stream   io.Writer
-	Now      func() float64
-	Sleep    func(float64)
-	Context  string
-	Data     *store.ServiceData
-	SlotPoll time.Duration
-	NetTime  time.Duration
+	Cfg     *config.Config
+	FJ      config.ForgejoSpec
+	API     forgejo.API
+	Name    string
+	Host    string
+	RepoDir string
+	GitEnv  map[string]string
+	Env     config.Env
+	Stream  io.Writer
+	Now     func() float64
+	Sleep   func(float64)
+	Context string
+	Data    *store.ServiceData
+	NetTime time.Duration
 
 	target    atomic.Pointer[string]
 	permCache map[string]string
@@ -98,6 +95,7 @@ type Service struct {
 	liveMu    sync.Mutex
 	live      Live
 	pollNow   atomic.Bool
+	ciNow     atomic.Bool
 	stopping  atomic.Pointer[string]
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -135,12 +133,11 @@ func New(cfg *config.Config, repoDir string, o Options) (*Service, error) {
 		return nil, config.Errf("forgejo: %s not set", strings.Join(missing, ", "))
 	}
 	c := cfg.Copy()
-	c.CreateInteg = true
 	secretenv.Hide(fj.TokenEnv, fj.WebhookSecretEnv)
 	token := env[fj.TokenEnv]
-	s := &Service{Cfg: c, FJ: fj, API: o.API, Env: env, Stream: o.Stream, Now: o.Now, Sleep: o.Sleep, Slots: o.Slots,
+	s := &Service{Cfg: c, FJ: fj, API: o.API, Env: env, Stream: o.Stream, Now: o.Now, Sleep: o.Sleep,
 		permCache: map[string]string{}, prs: map[string]*store.PR{}, Data: &store.ServiceData{PRs: map[string]*store.PR{}},
-		SlotPoll: time.Second, NetTime: NetTimeout, stopCh: make(chan struct{})}
+		NetTime: NetTimeout, stopCh: make(chan struct{})}
 	if s.API == nil {
 		s.API = forgejo.New(fj.URL, fj.Owner, fj.Repo, token)
 	}
@@ -154,9 +151,6 @@ func New(cfg *config.Config, repoDir string, o Options) (*Service, error) {
 	s.Host = "unknown-host"
 	if fj.URL != "" {
 		s.Host = db.ForgeHost(fj.URL)
-	}
-	if s.Slots == nil {
-		s.Slots = instance.NewGateSlots(1)
 	}
 	abs, err := filepath.Abs(repoDir)
 	if err != nil {
@@ -185,9 +179,10 @@ func (s *Service) Say(msg string) {
 }
 
 type LiveGate struct {
-	Since float64
-	Log   string
-	PRs   []int
+	Since  float64
+	Log    string
+	RunURL string
+	PRs    []int
 }
 
 type Live struct {
@@ -382,6 +377,9 @@ func (s *Service) later(pr *store.PR, fn func()) {
 
 func (s *Service) status(pr *store.PR, st, desc, log string) {
 	n, sha, desc, link := pr.Number, pr.Head, s.Redact(desc), s.LogURL(log)
+	if link == "" && log != "" {
+		link = gate.RunURL(log)
+	}
 	s.later(pr, func() {
 		if err := s.API.Status(sha, st, s.Context, desc, link); err != nil {
 			s.Say(fmt.Sprintf("status for #%d: %s", n, err))
@@ -440,8 +438,9 @@ func (s *Service) Redact(x string) string {
 			forms = append(forms, f, strings.TrimSuffix(strings.TrimRight(f, "/"), ".git"))
 		}
 		sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+		web := strings.TrimRight(s.FJ.URL, "/")
 		for _, f := range forms {
-			if f != "" {
+			if f != "" && (web == "" || f != web && !strings.HasPrefix(f, web+"/")) {
 				x = strings.ReplaceAll(x, f, "<git remote>")
 			}
 		}
@@ -498,22 +497,14 @@ func (s *Service) Tick() (err error) {
 	if err != nil {
 		msg := head(s.Redact(err.Error()), 300)
 		s.setLive(func(l *Live) { l.LastError = msg })
-		s.leaveLine()
 		return err
 	}
 	if fd == nil {
-		s.leaveLine()
 		return nil
 	}
 	defer fd.Close()
 	s.phase(states.PhaseSync, "")
-	defer func() {
-		if s.Slots.State(s.Name) == states.SlotWaiting {
-			s.phase(states.PhaseQueue, "")
-		} else {
-			s.phase(states.PhaseRest, "")
-		}
-	}()
+	defer s.phase(states.PhaseRest, "")
 	defer func() {
 		if r := recover(); r != nil {
 			err = panics.AsError(r)
@@ -521,7 +512,6 @@ func (s *Service) Tick() (err error) {
 		if err != nil {
 			msg := head(s.Redact(fmt.Sprintf("%v", err)), 300)
 			s.setLive(func(l *Live) { l.LastError = msg })
-			s.leaveLine()
 		}
 	}()
 	return s.tick()
@@ -536,7 +526,14 @@ func (s *Service) cycleLock() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	var err2 error
+	for try := 0; try < 100; try++ {
+		if err2 = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err2 != syscall.EWOULDBLOCK {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := err2; err != nil {
 		if err != syscall.EWOULDBLOCK {
 			f.Close()
 			return nil, fmt.Errorf("cannot lock %s: %w", path, err)
@@ -561,7 +558,6 @@ func (s *Service) tick() error {
 	if !s.ResolveTarget() {
 		s.Say(fmt.Sprintf("the target branch is not known yet (one of %s): nothing is synced this cycle",
 			strings.Join(s.Cfg.Target, ", ")))
-		s.leaveLine()
 		return nil
 	}
 	s.Data = must(s.store().Load())
@@ -586,33 +582,16 @@ func (s *Service) tick() error {
 	s.expireBackoff()
 	if backoffOf(s.Data) == states.BackingOff {
 		s.Say(fmt.Sprintf("waiting until %s after: %s", db.Time(s.Data.Until()).Format("15:04:05"), s.Data.BackoffWhy))
-		s.leaveLine()
 		return nil
 	}
 	batch := s.Pick(prs)
 	if len(batch) == 0 {
-		s.leaveLine()
 		return nil
 	}
-	inLine := s.Slots.State(s.Name) == states.SlotWaiting
-	if !s.Slots.Ready(s.Name) {
-		if s.Stopping() != "" || s.Slots.Closed() {
-			return nil
-		}
-		if !inLine {
-			snap := s.Slots.Snapshot()
-			s.Say(fmt.Sprintf("waiting for a gate slot (%d of %d in use: %s)", len(snap.Running), snap.Max,
-				strings.Join(snap.Running, ", ")))
-		}
+	if s.Stopping() != "" {
 		return nil
 	}
-	func() {
-		defer func() {
-			s.Slots.Release(s.Name)
-			s.Slots.Withdraw(s.Name)
-		}()
-		s.RunBatch(batch)
-	}()
+	s.RunBatch(batch)
 	check(s.store().Save(s.Data))
 	return nil
 }
@@ -628,12 +607,6 @@ func sortedKeys(m map[string]*store.PR) []string {
 		return a < b
 	})
 	return keys
-}
-
-func (s *Service) leaveLine() {
-	if s.Slots.State(s.Name) == states.SlotWaiting {
-		s.Slots.Withdraw(s.Name)
-	}
 }
 
 func inStates(pr *store.PR, sts ...states.State) bool {
@@ -1100,6 +1073,9 @@ func (s *Service) StatusText(pr *store.PR) string {
 		if len(others) > 0 {
 			out += " with " + engine.AndList(others)
 		}
+		if g := s.Live().Gate; g != nil && g.RunURL != "" && slices.Contains(g.PRs, n) {
+			out += " (CI: " + g.RunURL + ")"
+		}
 	case states.SetAside:
 		reason := pr.Reason
 		if reason == "" {
@@ -1491,12 +1467,12 @@ func (s *Service) runBatch(batch []*store.PR) {
 		}()
 		eng, err := engine.New(cfg, s.RepoDir, engine.Options{
 			Lander: &approvedLander{PushLander: &engine.PushLander{Repo: s.pushGit(), Remote: s.FJ.GitRemoteURL, Target: t}, s: s},
-			Events: s,
+			CI:     ciForge{s}, Ignore: s.Context, Events: s,
 			Stream: redactWriter{s}, GitEnv: g.Env, Sleep: s.Sleep, RepoKey: s.RepoKey(), ResetStaleInteg: true})
 		if err != nil {
 			return err
 		}
-		res, err := eng.Run(items, engine.RunOptions{Batch: true, Args: "service batch", RunID: runID})
+		res, err := eng.Run(items, engine.RunOptions{Args: "service batch", RunID: runID})
 		if err != nil {
 			return err
 		}
@@ -1642,30 +1618,89 @@ func (s *Service) Gating(items []engine.Item, log string) {
 	s.setLive(func(l *Live) { l.Gate = &LiveGate{Since: s.Now(), Log: filepath.Base(log), PRs: prs} })
 	for _, it := range items {
 		if pr, ok := s.prs[it.Name]; ok {
-			s.status(pr, "pending", fmt.Sprintf("gate running (with %d other PR(s))", len(items)-1), log)
+			s.status(pr, "pending", fmt.Sprintf("CI running on the merged result (with %d other PR(s))", len(items)-1), log)
 		}
 	}
 }
 
-func (s *Service) GateSlot(what string) string {
-	if s.Slots.TryAcquire(s.Name) {
-		return ""
+func (s *Service) CIStarted(items []engine.Item, url string) {
+	s.setLive(func(l *Live) {
+		if l.Gate != nil {
+			l.Gate.RunURL = url
+		}
+	})
+	for _, it := range items {
+		if pr, ok := s.prs[it.Name]; ok {
+			n, sha, desc := pr.Number, pr.Head, s.Redact(fmt.Sprintf("CI running on the merged result (with %d other PR(s))",
+				len(items)-1))
+			s.later(pr, func() {
+				if err := s.API.Status(sha, "pending", s.Context, desc, url); err != nil {
+					s.Say(fmt.Sprintf("status for #%d: %s", n, err))
+				}
+			})
+		}
 	}
-	snap := s.Slots.Snapshot()
-	s.Say(fmt.Sprintf("waiting for a gate slot (%s; %d of %d in use: %s)", what, len(snap.Running), snap.Max,
-		strings.Join(snap.Running, ", ")))
-	s.phase(states.PhaseWaitSlot, what)
-	why := s.Slots.Acquire(s.Name, s.Poll, s.SlotPoll)
-	s.phase(states.PhaseGotSlot, "")
-	return why
 }
 
-func (s *Service) GateDone() {
-	s.setLive(func(l *Live) { l.Gate = nil })
-	s.Slots.Release(s.Name)
+func (s *Service) GateDone() { s.setLive(func(l *Live) { l.Gate = nil }) }
+
+type ciForge struct{ s *Service }
+
+func (f ciForge) Push(sha, branch string) error {
+	ref := "refs/heads/" + branch
+	push := func(spec string) (gitx.Result, error) {
+		r := f.s.AuthGit().AuthRun("push", "--porcelain", "--force", f.s.FJ.GitRemoteURL, spec)
+		if !r.OK() {
+			return r, fmt.Errorf("git push %s failed: %s", spec, gitx.LastLine(r.Out))
+		}
+		return r, nil
+	}
+	r, err := push(sha + ":" + ref)
+	if err != nil {
+		return err
+	}
+	if !upToDate(r.Out, ref) {
+		return nil
+	}
+	if _, err := push(":" + ref); err != nil {
+		return err
+	}
+	_, err = push(sha + ":" + ref)
+	return err
 }
 
-func (s *Service) Nudge() { s.pollNow.Store(true) }
+func upToDate(porcelain, ref string) bool {
+	for _, line := range gitx.Lines(porcelain) {
+		if f := strings.Split(line, "\t"); len(f) >= 2 && strings.HasSuffix(f[1], ":"+ref) {
+			return strings.HasPrefix(f[0], "=")
+		}
+	}
+	return false
+}
+
+func (f ciForge) Statuses(sha string) ([]forgejo.CommitStatus, error) {
+	sts, err := f.s.API.Statuses(sha)
+	if err != nil {
+		return nil, err
+	}
+	origin := ""
+	if u, perr := url.Parse(f.s.FJ.URL); perr == nil && u.Scheme != "" && u.Host != "" {
+		origin = u.Scheme + "://" + u.Host
+	}
+	for i, st := range sts {
+		if origin != "" && strings.HasPrefix(st.TargetURL, "/") && !strings.HasPrefix(st.TargetURL, "//") {
+			sts[i].TargetURL = origin + st.TargetURL
+		}
+	}
+	return sts, nil
+}
+
+func (s *Service) Nudge() {
+	s.pollNow.Store(true)
+	s.ciNow.Store(true)
+}
+
+func (s *Service) CINow() bool { return s.ciNow.Swap(false) }
 
 func (s *Service) Stop(why string) {
 	s.stopping.Store(&why)

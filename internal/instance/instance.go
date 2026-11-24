@@ -9,13 +9,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"murasame/internal/config"
 	"murasame/internal/db"
 	"murasame/internal/secretenv"
-	"murasame/internal/states"
 )
 
 var InstanceKeys = []string{"url", "token_env", "bot_user", "listen", "webhook_secret_env", "poll_interval",
@@ -42,19 +39,18 @@ type RepoEntry struct {
 }
 
 type Spec struct {
-	Path               string
-	Multi              bool
-	Repos              []RepoEntry
-	BotUser            string
-	Listen             string
-	WebhookSecretEnv   string
-	PollInterval       int
-	MaxConcurrentGates int
-	ExternalURL        string
-	StateDir           string
-	DB                 string
-	Forges             map[string]*ForgeSpec
-	ForgeOrder         []string
+	Path             string
+	Multi            bool
+	Repos            []RepoEntry
+	BotUser          string
+	Listen           string
+	WebhookSecretEnv string
+	PollInterval     int
+	ExternalURL      string
+	StateDir         string
+	DB               string
+	Forges           map[string]*ForgeSpec
+	ForgeOrder       []string
 }
 
 func merge(base, over map[string]any) map[string]any {
@@ -81,14 +77,13 @@ type multiFile struct {
 }
 
 type instanceTable struct {
-	BotUser            string `mapstructure:"bot_user"`
-	Listen             string `mapstructure:"listen"`
-	WebhookSecretEnv   string `mapstructure:"webhook_secret_env"`
-	PollInterval       int    `mapstructure:"poll_interval"`
-	MaxConcurrentGates int    `mapstructure:"max_concurrent_gates"`
-	ExternalURL        string `mapstructure:"external_url"`
-	StateDir           string `mapstructure:"state_dir"`
-	DB                 string `mapstructure:"db"`
+	BotUser          string `mapstructure:"bot_user"`
+	Listen           string `mapstructure:"listen"`
+	WebhookSecretEnv string `mapstructure:"webhook_secret_env"`
+	PollInterval     int    `mapstructure:"poll_interval"`
+	ExternalURL      string `mapstructure:"external_url"`
+	StateDir         string `mapstructure:"state_dir"`
+	DB               string `mapstructure:"db"`
 }
 
 type forgeTable struct {
@@ -142,7 +137,7 @@ func Load(path string, text *string, env config.Env, repoDir string) (*Spec, err
 			repoDir = "."
 		}
 		return &Spec{Path: path, Repos: []RepoEntry{{name, cfg, abs(repoDir)}}, BotUser: fj.BotUser, Listen: fj.Listen,
-			WebhookSecretEnv: fj.WebhookSecretEnv, PollInterval: fj.PollInterval, MaxConcurrentGates: 1,
+			WebhookSecretEnv: fj.WebhookSecretEnv, PollInterval: fj.PollInterval,
 			ExternalURL: fj.ExternalURL, Forges: map[string]*ForgeSpec{}}, nil
 	}
 	return multi(config.ExpandEnv(raw, env).(map[string]any), path, env)
@@ -154,7 +149,7 @@ func multi(d map[string]any, path string, env config.Env) (*Spec, error) {
 		return nil, err
 	}
 	inst := instanceTable{BotUser: "murasame", Listen: "127.0.0.1:8737", WebhookSecretEnv: "MURASAME_WEBHOOK_SECRET",
-		PollInterval: 60, MaxConcurrentGates: 1, DB: db.DefaultName}
+		PollInterval: 60, DB: db.DefaultName}
 	if err := config.Decode(f.Instance, &inst, "instance"); err != nil {
 		return nil, err
 	}
@@ -163,9 +158,6 @@ func multi(d map[string]any, path string, env config.Env) (*Spec, error) {
 	}
 	if inst.PollInterval <= 0 {
 		return nil, config.Errf("instance.poll_interval: more than 0 s, not %d", inst.PollInterval)
-	}
-	if inst.MaxConcurrentGates < 1 {
-		return nil, config.Errf("instance.max_concurrent_gates: at least 1")
 	}
 	here := abs(".")
 	if path != "" {
@@ -176,8 +168,7 @@ func multi(d map[string]any, path string, env config.Env) (*Spec, error) {
 		sd = filepath.Join(here, sd)
 	}
 	spec := &Spec{Path: path, Multi: true, BotUser: inst.BotUser, Listen: inst.Listen,
-		WebhookSecretEnv: inst.WebhookSecretEnv, PollInterval: inst.PollInterval,
-		MaxConcurrentGates: inst.MaxConcurrentGates, ExternalURL: inst.ExternalURL, StateDir: sd,
+		WebhookSecretEnv: inst.WebhookSecretEnv, PollInterval: inst.PollInterval, ExternalURL: inst.ExternalURL, StateDir: sd,
 		DB: db.Path(sd, inst.DB), Forges: map[string]*ForgeSpec{}}
 	if len(f.Forges) == 0 {
 		return nil, config.Errf("forges: at least one [forges.<name>] table (url, token_env)")
@@ -478,218 +469,4 @@ func repo(r any, i int, spec *Spec, here string, env config.Env) (RepoEntry, err
 	return RepoEntry{name, cfg, clone}, nil
 }
 
-type GateSlots struct {
-	N         int
-	mu        sync.Mutex
-	changed   chan struct{}
-	Holders   []string
-	Waiting   []string
-	listeners []func()
-	closed    bool
-	gating    map[string]bool
-}
-
-func NewGateSlots(n int) *GateSlots {
-	if n < 1 {
-		n = 1
-	}
-	return &GateSlots{N: n, changed: make(chan struct{}), gating: map[string]bool{}}
-}
-
-func (g *GateSlots) AddListener(f func()) {
-	g.mu.Lock()
-	g.listeners = append(g.listeners, f)
-	g.mu.Unlock()
-}
-
-func remove(xs []string, x string) []string {
-	if i := slices.Index(xs, x); i >= 0 {
-		return append(xs[:i:i], xs[i+1:]...)
-	}
-	return xs
-}
-
-func (g *GateSlots) notify() {
-	close(g.changed)
-	g.changed = make(chan struct{})
-}
-
 const Closing = "the service is stopping"
-
-func (g *GateSlots) Close() {
-	g.mu.Lock()
-	if !g.closed {
-		g.closed = true
-		for _, who := range append([]string{}, g.Waiting...) {
-			g.step(who, states.SlotWithdraw)
-		}
-		g.notify()
-	}
-	g.mu.Unlock()
-}
-
-func (g *GateSlots) Closed() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.closed
-}
-
-func (g *GateSlots) at(who string) states.Slot {
-	switch {
-	case slices.Index(g.Holders, who) >= 0:
-		return states.SlotHolding
-	case slices.Index(g.Waiting, who) >= 0:
-		return states.SlotWaiting
-	}
-	return states.SlotOut
-}
-
-func (g *GateSlots) step(who string, ev states.SlotEvent) {
-	states.SlotMachine.Must(g.at(who), ev)
-	if ev != states.SlotJoin {
-		delete(g.gating, who)
-	}
-	switch ev {
-	case states.SlotJoin:
-		g.Waiting = append(g.Waiting, who)
-	case states.SlotGrant:
-		g.Waiting = remove(g.Waiting, who)
-		g.Holders = append(g.Holders, who)
-	case states.SlotRelease:
-		g.Holders = remove(g.Holders, who)
-	case states.SlotWithdraw:
-		g.Waiting = remove(g.Waiting, who)
-	}
-}
-
-func (g *GateSlots) State(who string) states.Slot {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.at(who)
-}
-
-func (g *GateSlots) Ready(who string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closed {
-		return false
-	}
-	if g.at(who) == states.SlotHolding {
-		return true
-	}
-	if g.at(who) == states.SlotOut {
-		g.step(who, states.SlotJoin)
-	}
-	return g.freeFor(who, false)
-}
-
-func (g *GateSlots) TryAcquire(who string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closed {
-		return false
-	}
-	if g.at(who) == states.SlotHolding {
-		return true
-	}
-	if g.at(who) == states.SlotOut {
-		g.step(who, states.SlotJoin)
-	}
-	g.gating[who] = true
-	if g.freeFor(who, true) {
-		g.step(who, states.SlotGrant)
-		return true
-	}
-	return false
-}
-
-func (g *GateSlots) Acquire(who string, poll func() string, every time.Duration) string {
-	if every <= 0 {
-		every = time.Second
-	}
-	for {
-		if g.TryAcquire(who) {
-			return ""
-		}
-		if g.Closed() {
-			return Closing
-		}
-		if poll != nil {
-			if why := poll(); why != "" {
-				g.Withdraw(who)
-				return why
-			}
-		}
-		g.mu.Lock()
-		ch := g.changed
-		wait := g.at(who) != states.SlotHolding && !g.freeFor(who, true)
-		g.mu.Unlock()
-		if wait {
-			select {
-			case <-ch:
-			case <-time.After(every):
-			}
-		}
-	}
-}
-
-func (g *GateSlots) freeFor(who string, gate bool) bool {
-	free := g.N - len(g.Holders)
-	i := slices.Index(g.Waiting, who)
-	if i < 0 || free <= 0 {
-		return false
-	}
-	ahead := 0
-	for _, w := range g.Waiting[:i] {
-		if !gate || g.gating[w] {
-			ahead++
-		}
-	}
-	return ahead < free
-}
-
-func (g *GateSlots) Release(who string) {
-	g.mu.Lock()
-	if g.at(who) == states.SlotHolding {
-		g.step(who, states.SlotRelease)
-	}
-	g.notify()
-	var ls []func()
-	if len(g.Waiting) > 0 {
-		ls = append(ls, g.listeners...)
-	}
-	g.mu.Unlock()
-	for _, f := range ls {
-		f()
-	}
-}
-
-func (g *GateSlots) Withdraw(who string) {
-	g.mu.Lock()
-	wake := false
-	if g.at(who) == states.SlotWaiting {
-		g.step(who, states.SlotWithdraw)
-		wake = len(g.Waiting) > 0
-		g.notify()
-	}
-	var ls []func()
-	if wake {
-		ls = append(ls, g.listeners...)
-	}
-	g.mu.Unlock()
-	for _, f := range ls {
-		f()
-	}
-}
-
-type Snapshot struct {
-	Max     int      `json:"max"`
-	Running []string `json:"running"`
-	Waiting []string `json:"waiting"`
-}
-
-func (g *GateSlots) Snapshot() Snapshot {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return Snapshot{g.N, append([]string{}, g.Holders...), append([]string{}, g.Waiting...)}
-}

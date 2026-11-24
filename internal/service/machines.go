@@ -215,9 +215,7 @@ func (s *Service) phase(ev states.PhaseEvent, what string) {
 		return
 	}
 	s.live.Phase, s.live.What = to, what
-	if ev != states.PhaseGotSlot {
-		s.live.Gate = nil
-	}
+	s.live.Gate = nil
 }
 
 func (l Live) PhaseText() string { return states.PhaseText(l.Phase, l.What) }

@@ -5,7 +5,6 @@ webhook_secret_env = "MURASAME_WEBHOOK_SECRET"
 state_dir = "${MURASAME_STATE:-/var/lib/murasame}"
 db = "murasame.sqlite3"
 poll_interval = 60
-max_concurrent_gates = 1
 external_url = ""
 
 [forges.main]
@@ -30,30 +29,16 @@ name = "docs"
 
 [repos.repo]
 target = ["main"]
-batch = true
 pair_check = false
 
-[repos.gates.build]
-command = ["make", "html"]
+[repos.ci]
+contexts = ["docs / build (push)"]
 timeout = 1800
-retries = 2
-retry_wait = 60
 
 [[repos.conflicts]]
 label = "docs"
 paths = ["**/*.md"]
 strategy = "keep-both"
-
-[[repos.conflicts]]
-label = "search index"
-paths = ["search-index.json"]
-strategy = "command"
-run = ["make", "search-index"]
-
-[[repos.hooks.post_merge]]
-name = "toc"
-run = ["make", "toc"]
-timeout = 300
 
 [repos.forgejo]
 reviewers_from_permission = "write"

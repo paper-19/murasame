@@ -46,7 +46,3 @@ var IntegMachine = &Machine[IntegState, IntegEvent]{
 		{IntegDirty, IntegOnReset}:      IntegAtTarget,
 	},
 }
-
-func (s IntegState) Working() bool {
-	return s == IntegBuilding || s == IntegBuilt || s == IntegGated || s == IntegLanded
-}

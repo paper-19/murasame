@@ -277,24 +277,19 @@ func (w *Worker) Stop() {
 type Runtime struct {
 	Services map[string]*service.Service
 	Order    []string
-	Slots    *instance.GateSlots
 	Workers  map[string]*Worker
 	mu       sync.Mutex
 	state    *states.Tracker[states.Runtime, states.RuntimeEvent]
 }
 
-func NewRuntime(services []*service.Service, interval time.Duration, slots *instance.GateSlots) *Runtime {
-	if slots == nil {
-		slots = instance.NewGateSlots(1)
-	}
-	rt := &Runtime{Services: map[string]*service.Service{}, Slots: slots, Workers: map[string]*Worker{},
+func NewRuntime(services []*service.Service, interval time.Duration) *Runtime {
+	rt := &Runtime{Services: map[string]*service.Service{}, Workers: map[string]*Worker{},
 		state: states.RuntimeMachine.Start()}
 	for _, s := range services {
 		rt.Services[s.Name] = s
 		rt.Order = append(rt.Order, s.Name)
 		rt.Workers[s.Name] = NewWorker(s, interval)
 	}
-	slots.AddListener(rt.slotFreed)
 	return rt
 }
 
@@ -312,14 +307,6 @@ func (rt *Runtime) Ticks() int64 {
 		n += w.Ticks()
 	}
 	return n
-}
-
-func (rt *Runtime) slotFreed() {
-	for _, n := range rt.Slots.Snapshot().Waiting {
-		if w, ok := rt.Workers[n]; ok {
-			w.signal()
-		}
-	}
 }
 
 func (rt *Runtime) Wake(names []string) {
@@ -581,10 +568,10 @@ func Handler(rt *Runtime, secret string) http.Handler {
 		}()
 		switch {
 		case len(parts) == 0:
-			send(w, 200, []byte(status.Render(status.View(rt.List(), rt.Slots))), "text/html; charset=utf-8", nil)
+			send(w, 200, []byte(status.Render(status.View(rt.List()))), "text/html; charset=utf-8", nil)
 			return
 		case len(parts) == 2 && parts[0] == "api" && parts[1] == "status":
-			sendJSON(w, status.View(rt.List(), rt.Slots), 200)
+			sendJSON(w, status.View(rt.List()), 200)
 			return
 		case len(parts) == 4 && parts[0] == "repos" && parts[2] == "logs":
 			if svc, ok := rt.Services[parts[1]]; ok {
@@ -667,8 +654,8 @@ func urlUnquote(s string) string {
 	return strings.ToValidUTF8(b.String(), "�")
 }
 
-func Start(services []*service.Service, listen, secret string, interval time.Duration, slots *instance.GateSlots) (*http.Server, net.Listener, *Runtime, error) {
-	rt := NewRuntime(services, interval, slots)
+func Start(services []*service.Service, listen, secret string, interval time.Duration) (*http.Server, net.Listener, *Runtime, error) {
+	rt := NewRuntime(services, interval)
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
 		i := strings.LastIndex(listen, ":")
@@ -695,24 +682,23 @@ func Start(services []*service.Service, listen, secret string, interval time.Dur
 	return srv, ln, rt, nil
 }
 
-func ServicesOf(spec *instance.Spec, env config.Env, stream io.Writer) ([]*service.Service, *instance.GateSlots, error) {
+func ServicesOf(spec *instance.Spec, env config.Env, stream io.Writer) ([]*service.Service, error) {
 	if stream == nil {
 		stream = os.Stdout
 	}
-	slots := instance.NewGateSlots(spec.MaxConcurrentGates)
 	var out []*service.Service
 	for _, e := range spec.Repos {
 		var st io.Writer = stream
 		if spec.Multi {
 			st = &PrefixStream{Out: stream, Name: e.Name}
 		}
-		s, err := service.New(e.Cfg, e.Clone, service.Options{Env: env, Name: e.Name, Slots: slots, Stream: st})
+		s, err := service.New(e.Cfg, e.Clone, service.Options{Env: env, Name: e.Name, Stream: st})
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		out = append(out, s)
 	}
-	return out, slots, nil
+	return out, nil
 }
 
 var servicesOf = ServicesOf
@@ -721,25 +707,23 @@ func Serve(spec *instance.Spec, once bool) int {
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(sig)
-	services, slots, err := servicesOf(spec, nil, nil)
+	services, err := servicesOf(spec, nil, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "murasame: %s\n", err)
 		return 2
 	}
 	defer flushStreams(services)
 	say := InstanceSay(services)
-	if w := PrefixWarning(services, secretenv.HardenProcess()); w != "" {
-		say(w)
-	}
+	secretenv.HardenProcess()
 	if once {
-		return TickUntilStopped(services, slots, sig, say, func() { os.Exit(1) })
+		return TickUntilStopped(services, sig, say, func() { os.Exit(1) })
 	}
 	secret := os.Getenv(spec.WebhookSecretEnv)
 	if secret == "" {
 		say(fmt.Sprintf("WARNING: no webhook secret ($%s): any POST /webhook wakes the workers (they only re-read the "+
 			"API, but set a secret)", spec.WebhookSecretEnv))
 	}
-	srv, _, rt, err := Start(services, spec.Listen, secret, time.Duration(spec.PollInterval)*time.Second, slots)
+	srv, _, rt, err := Start(services, spec.Listen, secret, time.Duration(spec.PollInterval)*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "murasame: %s\n", err)
 		return 1
@@ -752,39 +736,19 @@ func Serve(spec *instance.Spec, once bool) int {
 	if len(services) == 1 {
 		what = "repository"
 	}
-	say(fmt.Sprintf("listening on %s; %d %s (%s); polling every %d s; at most %d gate(s) at once; status page: loopback "+
-		"clients only", spec.Listen, len(services), what, strings.Join(names, ", "), spec.PollInterval, spec.MaxConcurrentGates))
+	say(fmt.Sprintf("listening on %s; %d %s (%s); polling every %d s; gates run in Forgejo Actions; status page: "+
+		"loopback clients only", spec.Listen, len(services), what, strings.Join(names, ", "), spec.PollInterval))
 	<-sig
-	say("stopping: no new gate starts; waiting for the current ticks (a second signal stops at once)")
+	say("stopping: no new batch starts; waiting for the current ticks (a second signal stops at once)")
 	if Shutdown(srv, rt, sig) {
 		fmt.Fprintln(os.Stderr, "stopped")
 		return 0
 	}
-	fmt.Fprintln(os.Stderr, "stopped at once (a second signal): a running gate may be left behind")
+	fmt.Fprintln(os.Stderr, "stopped at once (a second signal): a CI run may still be going on the staging branch")
 	return 1
 }
 
-func PrefixWarning(services []*service.Service, hard string) string {
-	var bare []string
-	for _, s := range services {
-		if len(s.Cfg.CommandPrefix) == 0 {
-			bare = append(bare, s.Name)
-		}
-	}
-	if len(bare) == 0 {
-		return ""
-	}
-	lead := ""
-	if hard != "non-dumpable" {
-		lead = hard + "; "
-	}
-	return fmt.Sprintf("WARNING: %sno [repo] command_prefix for %s: their gates run as this user and can read the forge "+
-		"token from the environment of the git commands that talk to the forge (set command_prefix to run gates as "+
-		"another user)", lead, strings.Join(bare, ", "))
-}
-
 func Shutdown(srv *http.Server, rt *Runtime, again <-chan os.Signal) bool {
-	rt.Slots.Close()
 	for _, svc := range rt.Services {
 		svc.Stop(instance.Closing)
 	}
@@ -820,7 +784,7 @@ func InstanceSay(services []*service.Service) func(string) {
 	}
 }
 
-func TickUntilStopped(services []*service.Service, slots *instance.GateSlots, sig <-chan os.Signal, say func(string),
+func TickUntilStopped(services []*service.Service, sig <-chan os.Signal, say func(string),
 	exit func()) int {
 	var stopped atomic.Bool
 	done, finished := make(chan struct{}), make(chan struct{})
@@ -832,14 +796,13 @@ func TickUntilStopped(services []*service.Service, slots *instance.GateSlots, si
 			return
 		}
 		stopped.Store(true)
-		say("stopping: the running gate is stopped and its batch requeued (a second signal stops at once)")
-		slots.Close()
+		say("stopping: the batch waiting on CI is stopped and requeued (a second signal stops at once)")
 		for _, svc := range services {
 			svc.Stop(instance.Closing)
 		}
 		select {
 		case <-sig:
-			fmt.Fprintln(os.Stderr, "stopped at once (a second signal): a running gate may be left behind")
+			fmt.Fprintln(os.Stderr, "stopped at once (a second signal): a CI run may still be going on the staging branch")
 			exit()
 		case <-done:
 		}

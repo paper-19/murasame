@@ -6,84 +6,158 @@ nav_order: 5
 # Gates
 {: .no_toc }
 
-A gate is the command that decides whether a merged tree may land. It runs in
-`integ` after the merges.
+The gate is Forgejo Actions. murasame pushes each merged result to a staging
+branch and lands it only if the CI statuses on that commit pass.
 
 1. TOC
 {:toc}
 
-## Defining gates
+## How a gate runs
 
-Each `[gates.<name>]` table is a gate. You need at least one.
+```mermaid
+%%{init: {"sequence": {"mirrorActors": false}}}%%
+sequenceDiagram
+  participant M as murasame
+  participant F as Forgejo
+  participant R as runner
+  M->>M: merge the batch in integ → commit C
+  M->>F: push C to murasame/staging
+  F->>R: run the workflow on C
+  R-->>F: job statuses on C
+  loop every ci.poll_interval
+    M->>F: statuses of C?
+  end
+  alt passed
+    M->>F: push C to main
+  else failed
+    M->>M: bisect
+  end
+```
+
+What lands is the commit CI tested.
 
 ```toml
-[gate]
-default = "check"       # required with more than one gate
-timeout = 7200          # default timeout for all gates, seconds
-env = { CI = "1" }      # env for all gates
-
-[gates.check]
-command = ["sh", "-c", "make check || exit 1"]
-timeout = 3600
-retries = 1
-retry_wait = 30
-env = { GOFLAGS = "-count=1" }
-
-[gates.build]
-command = ["make", "build"]
+[ci]
+staging = "murasame/staging"
+contexts = ["ci / check (push)", "ci / lint (push)"]
+timeout = 3600          # no result after this: infrastructure failure
+start_timeout = 900     # no status at all after this: infrastructure failure
+poll_interval = 15
 ```
 
-Pick a gate per run with `murasame run --gate build`. All keys are in the
-[configuration reference](configuration.html#gates).
+All keys are in the [configuration reference](configuration.html#ci).
 
-The gate's environment is murasame's, plus `[gate] env`, plus the gate's `env`.
-Output goes to the terminal and to a log in `state_dir`, such as
-`20261121-091445-batch-feat-a+2.gate.log`.
+## The workflow
 
-Gate commands and env values can use these placeholders:
+{% raw %}
+```yaml
+name: ci
+on:
+  push:
+    branches: [murasame/staging]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - run: timeout 30m make check
+```
+{% endraw %}
 
-| Placeholder | Value |
-|---|---|
-| `{repo}` | The main checkout. |
-| `{state_dir}` | The state directory. |
-| `{integ}` | The integration tree (the working directory). |
-| `{target}` | The target branch. |
-| `{gate}` | The gate's name. |
-| `{retried}` | `1` on a retry, else `0`. |
-| `{base}` | The commit the branches were merged onto. |
+Forgejo reports one status per job, named `<workflow> / <job> (<event>)`: here
+`ci / check (push)`. The `concurrency` block cancels a run once murasame has
+pushed a newer commit to the staging branch, since murasame only waits for the
+last one.
 
-## Exit codes
+The bot user pushes the staging branch, so it needs write access (it has that
+to land PRs anyway), and the staging branch must not be protected.
 
-| Exit | Verdict | Result |
+## Verdicts
+
+murasame looks at the newest status of each context, counting only statuses
+of a run started after its push: a commit can already carry statuses, for
+example a PR's head that the queue fast-forwards to, or a commit gated before.
+Statuses that existed before the push, and later ones linking to the same run,
+don't count. With
+`contexts` set, only those count; with `contexts = []`, every new status
+counts, except murasame's own (`forgejo.status_context`).
+
+If the staging branch already points at the commit, a push changes nothing and
+starts no run, so murasame deletes the branch and pushes it again.
+
+| Statuses | Verdict | Result |
 |---|---|---|
-| 0 | pass | The tree may land. |
-| 1 | fail | The branch is at fault: set aside (batch) or the run stops (one by one). |
-| other | infrastructure failure | Retried. If every attempt fails, the run stops and no branch is blamed. |
+| all `success` or `warning` | pass | The batch lands. |
+| any `failure` or `error`, or a required context `skipped` after another job failed | fail | The batch is bisected; a single PR is set aside. |
+| a required context `skipped` with no job failed | infrastructure failure | The workflow skipped it (`if:` or path filters): the batch goes back in the queue. |
+| a job cancelled, and none failed | infrastructure failure | Not a test result: the batch goes back in the queue. |
+| `contexts = []` and every job `skipped` | infrastructure failure | Nothing was tested: the batch goes back in the queue. |
+| no status after `start_timeout` | infrastructure failure | The batch is put back in the queue, and the queue pauses for `infra_backoff`. |
+| a context in `contexts` never reported, `start_timeout` after the rest finished | infrastructure failure | The message names the contexts the run did report: usually a typo in `contexts`. |
+| no decision after `timeout` | infrastructure failure | The same. |
+| statuses unreadable 5 times in a row, or the push refused | infrastructure failure | The same. |
 
-Timeouts, commands that can't start (including exit 127), signals, and gates
-that leave processes running also count as infrastructure failures.
+A failure ends the wait at once, even while other jobs are still running.
+
+Forgejo creates a run's statuses as soon as the push arrives, as pending
+"Waiting to run", even with no runner online. So a missing runner is not caught
+by `start_timeout` but by `timeout`, whose message then says the jobs never
+started. Keep `timeout` within what you are willing to wait.
+
+A cancelled job reports `failure` with the description "Has been cancelled".
+murasame never cancels the run it waits for, so a cancel comes from a person or
+from another push to the staging branch: it is an infrastructure failure, and
+the batch goes back in the queue. A real failure in another counted job still
+fails the gate.
 
 {: .warning }
-`make` exits 2 when a target fails, so a bare `["make", "check"]` turns every
-test failure into an infrastructure failure and stops the queue. Use
-`["sh", "-c", "make check || exit 1"]` or make your test runner exit 1.
+Forgejo 15 with runner 9 does not enforce a job's `timeout-minutes`. A test
+that hangs runs until `ci.timeout`, which is an infrastructure failure: the
+batch is retried and the PR never set aside. Put a time limit in the step
+itself, for example `run: timeout 30m make check`, so a hang fails the job.
 
-### Retries
+A job skipped by an `if:`, or because a job it `needs` failed, didn't run.
+Forgejo 15 reports it as `success` with the description "Has been skipped";
+later versions report `skipped`. murasame treats both as skipped. For a
+context in `contexts`, a skip never passes the gate, since the job didn't test
+the commit: it fails the gate when another job failed, and is an
+infrastructure failure otherwise. With `contexts = []`, skipped jobs don't
+block as long as at least one job ran.
 
-`retries` (default 1) applies only to infrastructure failures, `retry_wait`
-seconds apart (default 30). Exit 1 is never retried.
+Forgejo doesn't write a status that repeats the newest one of its context. If
+an earlier run on the same commit is still waiting with the same description,
+the new run's first status may only appear once a job changes state; keep
+`start_timeout` above the time a job waits for a runner.
 
-```text
--- infrastructure failure, not a test result (check: exit 2): retry 1 of 1 in 30 s
-MERGE QUEUE STOPPED at feat-c: the check gate did not give a result in 2 attempt(s) (exit 2; log: ...)
-```
+{: .note }
+With `contexts = []`, murasame passes the commit as soon as every status
+reported so far has finished. Forgejo creates the statuses of all jobs of a run
+when the run starts, so one workflow is safe; with several workflows on the
+staging branch, one may finish before another starts. List the jobs in
+`contexts` then.
 
-`{retried}` lets the gate tell it is on a retry, for example to clear a cache.
+## Gate logs
+
+Each gate writes a short log to `state_dir`, such as
+`20261121-091445-batch-pr-12+2.gate.log`, with the statuses it saw and their
+links to the Actions runs. The status page serves these logs, and comments on
+set-aside PRs quote the failing status with its link.
+
+## Secrets
+
+A push to the staging branch runs the workflow with the repository's Actions
+secrets. Only approved PRs reach the staging branch, so a reviewer's
+approval is what lets a PR's code run with them, as with any merge queue.
 
 ## Pass records
 
-With records enabled, murasame stores every passing tree. If the same tree
-comes up again for the same gate config, the gate is skipped.
+With records enabled, murasame stores every tree that passed CI. If the same
+tree comes up again (for example, after a batch was stopped just before it
+landed), it lands without another CI run.
 
 ```toml
 [records]
@@ -91,79 +165,9 @@ enabled = true
 max_age = 172800    # seconds; default 2 days
 ```
 
-A record matches when the git tree hash is the same and the gate's name,
-`command`, `env`, `[gate] env` and `command_prefix` are unchanged. `timeout`
-and `retries` don't count. `run --regate` ignores records.
+A record matches when the git tree hash is the same and `ci.contexts` is
+unchanged. The workflow files are part of the tree, so changing them changes
+the tree.
 
-Within a run, murasame also remembers failed trees, so bisection never gates the
-same tree twice.
-
-## Affected tests
-
-A gate can have a cheaper second command that runs only the tests the change
-can affect, as chosen by your build tool:
-
-```toml
-[gates.check]
-command = ["make", "check"]
-affected_command = ["make", "check-affected", "BASE={base}"]
-full_when = ["go.mod", "go.sum", "Makefile", "ci/**"]
-full_every = 20                       # needs [records]
-```
-
-Inside `integ`, `git diff --name-only {base}` lists the change. For each tree:
-
-```mermaid
-flowchart LR
-  K{"knows what changed,<br/>integ clean?"} -->|yes| W{"a changed path<br/>matches full_when?"}
-  W -->|no| E{"full_every set, and due<br/>or no full run yet?"}
-  E -->|no| A[affected_command]
-  K -->|no| F["command (full)"]
-  W -->|yes| F
-  E -->|yes| F
-```
-
-The gate log says which and why, and `merges.log` marks those merges
-`scope=affected`. An affected-tests pass never counts as a full-run record.
-
-Full runs are still needed: dependency graphs miss generated code, fixtures and
-files read at run time, and `{base}` may itself have had only an affected run.
-
-## Gating ahead: `--no-land`
-
-`murasame run --no-land BRANCH` gates one branch as the queue would and records
-the pass instead of landing.
-
-It merges the branch onto the current target in its own throwaway worktree
-(`{state_dir}/no-land-<pid>`), with the same conflict rules, hooks, gate and
-environment. It skips the queue lock, so it can run alongside the queue. It
-needs records enabled and takes exactly one branch.
-
-```mermaid
-%%{init: {"sequence": {"mirrorActors": false}}}%%
-sequenceDiagram
-  participant N as run --no-land feat
-  participant R as pass records
-  participant Q as queue
-  N->>N: merge feat onto main, gate
-  N->>R: tree T passed
-  Q->>Q: merge feat onto main
-  Q->>R: tree passed?
-  alt same tree T, fresh record
-    R-->>Q: yes
-    Q->>Q: skip gate, land
-  else otherwise
-    R-->>Q: no
-    Q->>Q: gate as usual
-  end
-```
-
-The tree differs if the target has moved or the branch is batched with others.
-The skip message names the `…-no-land-<branch>.gate.log` it came from.
-
-For the Forgejo service, run it on the server with the service's config so the
-record lands in the service's database.
-
-{: .warning }
-No-land gates run alongside the queue's gate as the same user. Gates that use
-fixed ports, shared caches or fixed paths outside the worktree can collide.
+Within a run, murasame also remembers failed trees, so bisection never sends
+the same tree to CI twice.

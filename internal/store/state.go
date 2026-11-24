@@ -2,12 +2,10 @@ package store
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"murasame/internal/db"
 	"murasame/internal/states"
@@ -458,12 +456,6 @@ func (h *History) Interrupted(source, why string) (int, error) {
 	return h.interrupted(source, why, nil)
 }
 
-func (h *History) InterruptedGone(source, why string) (int, error) {
-	return h.interrupted(source, why, func(pid *int64, host *string) bool {
-		return host != nil && *host == db.Host && pid != nil && !pidAlive(int(*pid))
-	})
-}
-
 func (h *History) interrupted(source, why string, gone func(pid *int64, host *string) bool) (int, error) {
 	n := 0
 	err := h.DB.Tx(func(tx *db.Tx) error {
@@ -643,16 +635,3 @@ func (h *History) Merges(branch string, pr *int, limit int) ([]Merge, error) {
 }
 
 func osPid() int { return os.Getpid() }
-
-func PidAlive(pid int) bool { return pidAlive(pid) }
-
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	if pid == os.Getpid() {
-		return true
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}

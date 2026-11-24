@@ -78,7 +78,6 @@ func located(what string, err error) error {
 }
 
 var (
-	cmdType     = reflect.TypeOf(Cmd{})
 	stringsType = reflect.TypeOf([]string(nil))
 	strMapType  = reflect.TypeOf(map[string]string(nil))
 )
@@ -86,12 +85,6 @@ var (
 func typed(from, to reflect.Value) (any, error) {
 	v := from.Interface()
 	switch to.Type() {
-	case cmdType:
-		args, err := argv(v)
-		if err == nil && len(args) == 0 {
-			err = errors.New("an empty command (it needs at least the program)")
-		}
-		return Cmd{Args: args}, err
 	case stringsType:
 		return Strings(v)
 	case strMapType:
@@ -165,14 +158,6 @@ func StringMap(v any) (map[string]string, error) {
 		out[k] = s
 	}
 	return out, nil
-}
-
-func argv(v any) ([]string, error) {
-	if s, ok := v.(string); ok {
-		return nil, fmt.Errorf("a list of strings like [\"make\", \"check\"], not the string %q (for a shell line write "+
-			"[\"sh\", \"-c\", %q])", s, s)
-	}
-	return Strings(v)
 }
 
 func Table(v any, what string) (map[string]any, error) {

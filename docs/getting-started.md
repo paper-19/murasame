@@ -25,31 +25,54 @@ In a checkout you can also use `bin/murasame`. It rebuilds into
 `.murasame/bin/` on every call and loads `.env` if present (copy
 `.env.example`; the file is sourced as bash).
 
+## Add a workflow
+
+murasame pushes each merged result to a staging branch and waits for the
+commit statuses Forgejo Actions reports on it. Add a workflow that runs on
+pushes to that branch, `.forgejo/workflows/ci.yml`:
+
+{% raw %}
+```yaml
+name: ci
+on:
+  push:
+    branches: [murasame/staging]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - run: timeout 30m make check
+```
+{% endraw %}
+
+Its job reports the status `ci / check (push)`: `<workflow> / <job> (<event>)`.
+
 ## Write a config
 
-Pass the config with `--config FILE` or `MURASAME_CONFIG`. The only required
-table is a gate:
+Pass the config with `--config FILE` or `MURASAME_CONFIG`:
 
 ```toml
 [repo]
 target = ["main"]
-create_integ = true     # create the integration worktree on first run
-batch = true
 
-[gates.check]
-command = ["sh", "-c", "make check || exit 1"]
+[ci]
+contexts = ["ci / check (push)"]   # the statuses that must pass
 
 [records]
-enabled = true          # skip trees that already passed
+enabled = true                     # skip trees that already passed
+
+[forgejo]
+url = "https://forge.example.com"
+owner = "team"
+repo = "app"
+git_remote_url = "https://forge.example.com/team/app.git"
+reviewers_from_permission = "write"
 ```
-
-Commands are argument lists. For a shell line, use `["sh", "-c", "..."]`.
-
-{: .warning }
-The gate must exit 1 when tests fail. Any other non-zero code counts as an
-infrastructure failure: murasame retries it, then stops without blaming a
-branch. `make` exits 2 on failure, hence `|| exit 1`. See
-[exit codes](gates.html#exit-codes).
 
 Check how murasame reads it:
 
@@ -58,26 +81,24 @@ $ export MURASAME_CONFIG=murasame.toml
 $ murasame check-config
 config murasame.toml: ok
   target: main; integ: {state_dir}/integ; state: .murasame; state DB: murasame.sqlite3
-  gates: check (timeout 7200 s, retries 1 30 s apart); default check
+  CI: pushes to murasame/staging, then waits for ci / check (push) (timeout 7200 s; no status after 900 s: infrastructure failure; checked every 15 s)
   pair check: on
-  project commands run as this user (no command_prefix: they can read this process's secrets)
-  records: a tree that passed a gate is not gated again for 172800 s
+  records: a tree that passed CI is not sent to CI again for 172800 s
+  forgejo: https://forge.example.com team/app as murasame
+  approvals: `@murasame approve <full sha of the head>` comments by anyone with write permission
 ```
 
-State goes in `.murasame/` by default. Keep it out of git:
-
-```sh
-echo .murasame >> .git/info/exclude
-```
+With the token set, `murasame check-config --forge` also checks the
+repository: Actions on, the bot's permission, and the workflow.
 
 ## Run it
 
 ```sh
-murasame run --dry-run feature-a          # merge in a throwaway worktree, report only
-murasame run feature-a feature-b          # batch or not, per [repo].batch
-murasame run --one-by-one feature-a feature-b
-murasame history
+export MURASAME_FORGEJO_TOKEN=...   # the bot user's token
+murasame serve --repo /var/lib/murasame/app.git
 ```
 
-Branches merge in the order given. `run` exits 0 if everything landed and 1 if
-anything was set aside or the run stopped.
+`--repo` is the service's own bare clone; it is created on the first cycle.
+Then comment `@murasame approve <sha>` on a pull request. See
+[Forgejo service](forgejo.html) for the commands and
+[Deployment](deployment.html) for running it under systemd.

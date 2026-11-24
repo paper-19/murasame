@@ -25,9 +25,9 @@ in `examples/systemd/`.
 
 ## Prerequisites
 
-On the host: Linux with systemd, `git`, `curl`, HTTP access to Forgejo, and the
-tools your gates need installed system-wide. The unit sets `ProtectHome=yes`,
-so toolchains under `/home` are invisible to gates.
+On the host: Linux with systemd, `git`, `curl` and HTTP access to Forgejo. No
+build tools: the gate runs in Forgejo Actions, on your runners. Each repository
+needs a [workflow on the staging branch](gates.html#the-workflow).
 
 Build the binary anywhere:
 
@@ -53,6 +53,36 @@ it's shown once.
 Then give `murasame` write access to each repository, and make sure the target
 branch exists.
 
+## A Forgejo Actions runner
+
+Tested with `tests/e2e/forgejo.sh` against Forgejo 15 and 16 with runner 9.
+Forgejo 14 passes everything except cancelling a superseded run: there,
+`concurrency: cancel-in-progress` did not cancel it.
+
+The gate needs Actions enabled on the Forgejo instance (`[actions] ENABLED =
+true` in `app.ini`; on by default in recent versions) and at least one runner
+that picks up the workflow's `runs-on` label. Without one, every batch stops
+with "no CI status appeared".
+
+A runner in Docker, registered with a token from the Forgejo host:
+
+```sh
+# On the Forgejo host, as Forgejo's user:
+forgejo actions generate-runner-token
+
+# On the runner host:
+forgejo-runner register --no-interactive --instance https://forge.example.com \
+  --token <token> --name runner-1 --labels docker:docker://node:20-bookworm
+forgejo-runner daemon
+```
+
+`docker:docker://node:20-bookworm` runs each job in a fresh container; a label
+like `host:host` runs jobs directly on the runner host instead. Install the
+tools the workflow needs in the image or with setup actions
+(`actions/setup-go` and the like). The runner can be on another machine: it
+only needs to reach Forgejo over HTTP. Runner 9 does not enforce `timeout-minutes`: limit
+long steps yourself (see [Verdicts](gates.html#verdicts)).
+
 ## Install
 
 ```sh
@@ -61,11 +91,12 @@ sudo FORGEJO_URL=http://forge.example:3000 /tmp/install.sh /tmp/murasame
 
 The script creates the user with a git identity, installs the binary, and on
 the first run asks for the repository, the approvers and the token. It writes
-the config and opens it in `$EDITOR` so you can set the gate:
+the config and opens it in `$EDITOR` so you can set the CI statuses that must
+pass:
 
 ```toml
-[repos.gates.check]
-command = ["sh", "-c", "go vet ./... && go build ./... || exit 1"]
+[repos.ci]
+contexts = ["ci / check (push)"]
 ```
 
 It then starts the units and checks `/healthz`. Rerunning it with a new binary
@@ -99,20 +130,13 @@ existing install, set `listen` and `external_url` in the config yourself.
 
 ## Isolation
 
-Without `[repo] command_prefix`, gates, hooks and conflict commands run as the
-`murasame` user. The token is kept out of their environment, but they can still
-read the token file. `check-config` and `serve` warn about this.
+murasame runs no repository code: no gates, hooks or conflict commands. It
+holds the bot's token and talks to git and the forge API. The code runs on
+your Actions runners, which isolate jobs as you configured them.
 
-That's acceptable for code you trust. Otherwise run commands as another user or
-in a sandbox:
-
-```toml
-[repo]
-command_prefix = ["sudo", "-u", "murasame-ci", "--"]
-```
-
-The prefix can use `{repo}`, `{state_dir}`, `{integ}` and `{target}`, and it's
-part of the gate config that pass records are keyed on.
+A push to the staging branch runs the workflow with the repository's Actions
+secrets. Only approved PRs reach it, so a reviewer's approval is what lets a
+PR's code run with them.
 
 ## Uninstall
 

@@ -1,0 +1,27 @@
+# .forgejo/workflows/ci.yml in the repository murasame queues for.
+#
+# murasame pushes every merged result it wants gated to the staging branch
+# (ci.staging, default murasame/staging) and waits for this workflow's commit
+# statuses on that commit. Each job reports one status, named
+# "<workflow name> / <job name> (push)": list the ones that must pass in
+# ci.contexts ("ci / check (push)" here).
+name: ci
+
+on:
+  push:
+    branches: [murasame/staging]
+  pull_request:
+
+# A newer staging push replaces the older one: murasame only waits for the
+# commit it pushed last, so cancel the run it no longer reads.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      # The runner does not enforce timeout-minutes: limit the step, so a hang fails the job.
+      - run: timeout 30m make check

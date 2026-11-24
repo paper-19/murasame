@@ -14,7 +14,6 @@ import (
 	"murasame/internal/config"
 	"murasame/internal/gitx"
 	"murasame/internal/glob"
-	"murasame/internal/hooks"
 	"murasame/internal/states"
 )
 
@@ -362,15 +361,8 @@ func (m *Merge) end(on states.MergeEvent, why string) Merge {
 	return *m
 }
 
-func (m *Merge) AfterHooks(r hooks.Result) {
-	m.fire(states.MergeOnHooks)
-	m.fire(r.Event())
-	m.Why = r.Why
-}
-
 type Merger struct {
-	Cfg   *config.Config
-	Hooks *hooks.Hooks
+	Cfg *config.Config
 }
 
 func abort(tree *gitx.Git, orig, on string) {
@@ -405,6 +397,7 @@ func (mg *Merger) Merge(tree *gitx.Git, ref, branch, slug, message string) Merge
 	r := tree.Run(append(args, ref)...)
 	if r.OK() {
 		m.fire(states.MergeOnClean)
+		m.fire(states.MergeOnDone)
 		return m
 	}
 	if len(tree.Unmerged()) == 0 {
@@ -423,34 +416,15 @@ func (mg *Merger) Merge(tree *gitx.Git, ref, branch, slug, message string) Merge
 	}
 	m.fire(states.MergeOnConflict)
 	m.fire(states.MergeOnResolve)
-	mg.resolve(&m, tree, branch, slug, orig)
+	mg.resolve(&m, tree)
 	if m.State != states.MergeResolved {
 		abort(tree, orig, on)
 		return m
 	}
 	tree.Commit(message + "\n\nConflicts resolved by the merge queue: " + m.Note)
 	m.fire(states.MergeOnCommit)
+	m.fire(states.MergeOnDone)
 	return m
-}
-
-func moved(tree *gitx.Git, orig, on, what string) string {
-	now, at := tree.Rev("HEAD"), tree.HeadRef()
-	if now == orig && at == on && tree.Rev("MERGE_HEAD") != "" {
-		return ""
-	}
-	if at != on {
-		return fmt.Sprintf("%s switched integ's HEAD from %s to %s (it must only change files)", what, refName(on),
-			refName(at))
-	}
-	return fmt.Sprintf("%s moved integ's HEAD from %s to %s or ended the merge (it must only change files)", what,
-		short(orig), short(now))
-}
-
-func refName(ref string) string {
-	if ref == "" {
-		return "a detached HEAD"
-	}
-	return strings.TrimPrefix(ref, "refs/heads/")
 }
 
 func short(s string) string {
@@ -501,8 +475,7 @@ func take(tree *gitx.Git, path, side string) {
 	tree.MustRun("add", "--", gitx.Literal(path))
 }
 
-func (mg *Merger) resolve(m *Merge, tree *gitx.Git, branch, slug, orig string) {
-	on := tree.HeadRef()
+func (mg *Merger) resolve(m *Merge, tree *gitx.Git) {
 	var bad []string
 	groups := map[*config.ConflictRule][]string{}
 	for _, path := range tree.Unmerged() {
@@ -531,8 +504,6 @@ func (mg *Merger) resolve(m *Merge, tree *gitx.Git, branch, slug, orig string) {
 			tree.MustRun("add", "--", gitx.Literal(path))
 		case (rule.Strategy == "ours" || rule.Strategy == "theirs") && takeable(tree, path, rule.Strategy):
 			take(tree, path, rule.Strategy)
-		case rule.Strategy == "command" && takeable(tree, path, rule.Take):
-			take(tree, path, rule.Take)
 		default:
 			bad = append(bad, path)
 			continue
@@ -550,25 +521,6 @@ func (mg *Merger) resolve(m *Merge, tree *gitx.Git, branch, slug, orig string) {
 			continue
 		}
 		part := rule.Label + ": " + strings.Join(paths, " ")
-		if rule.Strategy == "command" {
-			if mg.Hooks == nil {
-				part += " (its command would run)"
-			} else {
-				before := tree.Snapshot()
-				r := mg.Hooks.Run(hooks.Command{What: "the " + rule.Label + " conflict command", Name: "resolve", Slug: slug,
-					Dir: tree.Cwd, Run: rule.Run, Extra: paths, Env: rule.Env, Timeout: rule.Timeout,
-					Vars: mg.Hooks.Vars.With("branch", branch)})
-				if !r.OK() {
-					m.end(r.Event(), r.Why)
-					return
-				}
-				if why := moved(tree, orig, on, "the "+rule.Label+" conflict command"); why != "" {
-					m.end(states.MergeOnFail, why)
-					return
-				}
-				tree.Stage(append(append([]string{}, paths...), tree.ChangedSince(before)...))
-			}
-		}
 		parts = append(parts, part)
 	}
 	m.fire(states.MergeOnResolved)

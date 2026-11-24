@@ -3,12 +3,10 @@ package gitx
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -311,22 +309,6 @@ func risky(entries []configEntry) []string {
 	return slices.Sorted(maps.Keys(seen))
 }
 
-func (g *Git) UnexpectedConfig() ([]string, error) {
-	entries, err := g.listConfig()
-	if err != nil {
-		return nil, err
-	}
-	return unexpected(entries), nil
-}
-
-func (g *Git) RiskyUserConfig() ([]string, error) {
-	entries, err := g.listConfig()
-	if err != nil {
-		return nil, err
-	}
-	return risky(entries), nil
-}
-
 func (g *Git) credentialRefusal() string {
 	if _, proxies := cleanInherited(); len(proxies) > 0 {
 		return fmt.Sprintf("refusing to use the bot's credentials: the service's environment sets %s, which would send "+
@@ -453,11 +435,6 @@ func (g *Git) IsAncestor(a, b string) bool {
 
 func (g *Git) Head() string { return g.Out("rev-parse", "HEAD") }
 
-func (g *Git) SymbolicHead() string {
-	out, _ := g.answer("symbolic-ref", "-q", "--short", "HEAD")
-	return out
-}
-
 func (g *Git) HeadRef() string {
 	out, _ := g.answer("symbolic-ref", "-q", "HEAD")
 	return out
@@ -504,24 +481,6 @@ func (g *Git) DirtyTracked() bool {
 	return strings.TrimSpace(g.MustStdout("status", "--porcelain", "--untracked-files=no")) != ""
 }
 
-func (g *Git) StatusPaths() []string {
-	fields := strings.Split(g.MustStdout("status", "--porcelain", "-z", "--untracked-files=all"), "\x00")
-	var out []string
-	for i := 0; i < len(fields); {
-		entry := fields[i]
-		i++
-		if len(entry) < 4 {
-			continue
-		}
-		out = append(out, entry[3:])
-		if (entry[0] == 'R' || entry[0] == 'C') && i < len(fields) {
-			out = append(out, fields[i])
-			i++
-		}
-	}
-	return out
-}
-
 func (g *Git) Unmerged() []string {
 	return splitNUL(g.MustStdout("diff", "--name-only", "-z", "--diff-filter=U"))
 }
@@ -553,8 +512,6 @@ func (g *Git) Commit(message string) {
 	}
 }
 
-func (g *Git) StagedChanges() bool { return !g.OK("diff", "--cached", "--quiet") }
-
 func LastLine(out string) string {
 	lines := Lines(strings.TrimSpace(out))
 	if len(lines) == 0 {
@@ -573,45 +530,6 @@ func Lines(s string) []string {
 
 func Literal(path string) string { return ":(literal)" + path }
 
-func fileSum(path string) string {
-	st, err := os.Lstat(path)
-	switch {
-	case err != nil:
-		return "-"
-	case st.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(path)
-		if err != nil {
-			return "symlink"
-		}
-		return fmt.Sprintf("symlink %x", sha256.Sum256([]byte(target)))
-	case st.IsDir():
-		return "dir"
-	case !st.Mode().IsRegular():
-		return "special " + st.Mode().Type().String()
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return "-"
-	}
-	defer f.Close()
-	if now, err := f.Stat(); err != nil || !now.Mode().IsRegular() {
-		return "special"
-	}
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "-"
-	}
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func (g *Git) Snapshot() map[string]string {
-	out := map[string]string{}
-	for _, p := range g.StatusPaths() {
-		out[p] = fileSum(filepath.Join(g.Cwd, p))
-	}
-	return out
-}
-
 func (g *Git) TopLevel() string { return g.Out("rev-parse", "--show-toplevel") }
 
 func (g *Git) Untracked() []string {
@@ -626,28 +544,6 @@ func (g *Git) WithoutCredentials() *Git {
 		}
 	}
 	return out
-}
-
-func (g *Git) ChangedSince(before map[string]string) []string {
-	var out []string
-	for p, sum := range g.Snapshot() {
-		if was, ok := before[p]; !ok || was != sum {
-			out = append(out, p)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func (g *Git) Stage(paths []string) {
-	if len(paths) == 0 {
-		return
-	}
-	args := []string{"add", "-A", "--"}
-	for _, p := range paths {
-		args = append(args, Literal(p))
-	}
-	g.MustRun(args...)
 }
 
 func ExitCode(cmd *exec.Cmd, err error) int {

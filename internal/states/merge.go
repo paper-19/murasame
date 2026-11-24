@@ -12,7 +12,6 @@ const (
 	MergeResolving   MergeState = "resolving"
 	MergeResolved    MergeState = "resolved"
 	MergeCommitted   MergeState = "committed"
-	MergeHooks       MergeState = "hooks"
 	MergeDone        MergeState = "done"
 	MergeAside       MergeState = "aside"
 	MergeNeedsPerson MergeState = "needs_person"
@@ -28,9 +27,7 @@ const (
 	MergeOnResolved  MergeEvent = "resolved"
 	MergeOnPerson    MergeEvent = "needs_person"
 	MergeOnCommit    MergeEvent = "commit"
-	MergeOnHooks     MergeEvent = "hooks"
 	MergeOnDone      MergeEvent = "done"
-	MergeOnFail      MergeEvent = "fail"
 	MergeOnInfra     MergeEvent = "infra"
 )
 
@@ -47,14 +44,10 @@ var MergeMachine = &Machine[MergeState, MergeEvent]{
 		{MergeConflicted, MergeOnResolve}: MergeResolving,
 		{MergeResolving, MergeOnResolved}: MergeResolved,
 		{MergeResolving, MergeOnPerson}:   MergeNeedsPerson,
-		{MergeResolving, MergeOnFail}:     MergeAside,
 		{MergeResolving, MergeOnInfra}:    MergeInfra,
 		{MergeResolved, MergeOnCommit}:    MergeCommitted,
-		{MergeClean, MergeOnHooks}:        MergeHooks,
-		{MergeCommitted, MergeOnHooks}:    MergeHooks,
-		{MergeHooks, MergeOnDone}:         MergeDone,
-		{MergeHooks, MergeOnFail}:         MergeAside,
-		{MergeHooks, MergeOnInfra}:        MergeInfra,
+		{MergeClean, MergeOnDone}:         MergeDone,
+		{MergeCommitted, MergeOnDone}:     MergeDone,
 	},
 }
 

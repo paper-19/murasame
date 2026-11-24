@@ -73,56 +73,13 @@ func (g *GateRecords) Find(tree, gate string, accept ...string) (found Found) {
 	age := int64(g.Now()) - t
 	switch {
 	case !slices.Contains(accept, r.GateHash):
-		return Found{Why: fmt.Sprintf("the %s record was written by another %s gate config or for another scope "+
-			"(an affected-tests pass does not stand in for a full run)", gate, gate), GateHash: r.GateHash}
+		return Found{Why: fmt.Sprintf("the %s record was written for other required CI contexts", gate),
+			GateHash: r.GateHash}
 	case age < -300 || age > int64(g.Spec.MaxAge):
 		return Found{Why: fmt.Sprintf("the %s record is %d s old (at most %d)", gate, age, g.Spec.MaxAge),
 			GateHash: r.GateHash}
 	}
 	return Found{OK: true, When: db.Time(float64(t)).Format("2006-01-02 15:04:05"), Log: r.Log, GateHash: r.GateHash}
-}
-
-type TargetHistory interface {
-	OnTarget(commit string) bool
-	Since(commit string) map[string]bool
-}
-
-func (g *GateRecords) SinceFull(gate, fullHash, affectedHash string, h TargetHistory) (n int, hasFull bool, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			n, hasFull, err = 0, false, fmt.Errorf("the gate records could not be read (%v)", r)
-		}
-	}()
-	repo := g.db()
-	type row struct {
-		Commit string `db:"commit_sha"`
-	}
-	q := "SELECT commit_sha FROM gate_records WHERE repo_id = ? AND gate = ? AND gate_hash = ? ORDER BY time DESC"
-	fulls, err := db.Select[row](repo.DB, q, repo.ID, gate, fullHash)
-	if err != nil {
-		return 0, false, err
-	}
-	latest := ""
-	for _, r := range fulls {
-		if h.OnTarget(r.Commit) {
-			latest = r.Commit
-			break
-		}
-	}
-	if latest == "" {
-		return 0, false, nil
-	}
-	affected, err := db.Select[row](repo.DB, q, repo.ID, gate, affectedHash)
-	if err != nil {
-		return 0, true, err
-	}
-	since := h.Since(latest)
-	for _, r := range affected {
-		if since[r.Commit] {
-			n++
-		}
-	}
-	return n, true, nil
 }
 
 func (g *GateRecords) Landed(tree, gate, commit string) error {

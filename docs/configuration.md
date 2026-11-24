@@ -7,11 +7,10 @@ nav_order: 6
 {: .no_toc }
 
 A project config describes one repository. It's TOML with these tables, all
-optional except at least one `[gates.<name>]`:
+optional (the service needs the connection keys of `[forgejo]`):
 
 ```text
-[repo]  [merge]  [gate]  [gates.<name>]  [[conflicts]]
-[[hooks.post_merge]]  [[hooks.post_land]]  [records]  [forgejo]
+[repo]  [merge]  [ci]  [[conflicts]]  [records]  [forgejo]
 ```
 
 A config with `[instance]`, `[forges]` or `[[repos]]` is a
@@ -25,9 +24,7 @@ Unknown keys, wrong types and unknown placeholders are errors.
 ## Value types
 
 - Durations are whole seconds.
-- Commands are string lists, run without a shell: `["make", "check"]`. For a
-  shell line, use `["sh", "-c", "..."]`.
-- Path patterns (`paths`, `exclude`, `full_when`) are globs from the repo root.
+- Path patterns (`paths`, `exclude`) are globs from the repo root.
   `*` stays within one path segment; `**` crosses segments.
 - Relative paths in `[repo]` are relative to the main checkout.
 
@@ -44,11 +41,6 @@ Braces inside an expanded environment value are kept literally.
 |---|---|
 | `repo.state_dir`, `repo.key` | `{repo}` |
 | `repo.integ`, `repo.db` | `{repo}` `{state_dir}` |
-| `repo.command_prefix` | `{repo}` `{state_dir}` `{integ}` `{target}` |
-| gate `command`, `affected_command`, `env`; `gate.env` | those four, plus `{gate}` `{retried}` `{base}` |
-| `hooks.post_merge` `run`, `env` | those four, plus `{branch}` `{hook}` |
-| `conflicts` `run`, `env` | those four, plus `{branch}` |
-| `hooks.post_land` `run`, `env`, `dir` | those four, plus `{hook}` `{target_sha}` `{target_short}` |
 
 ## [repo]
 
@@ -56,14 +48,10 @@ Braces inside an expanded environment value are kept literally.
 |---|---|---|
 | `target` | `["main"]` | Target branch: the first name that exists. |
 | `state_dir` | `".murasame"` | Logs, lock, `merges.log`, state DB, and by default `integ`. |
-| `integ` | `"{state_dir}/integ"` | The integration worktree. |
-| `create_integ` | `false` | Create `integ` if missing. |
+| `integ` | `"{state_dir}/integ"` | The integration worktree; created if missing. |
 | `db` | `"murasame.sqlite3"` | State DB, relative to `state_dir`. Not allowed in multi-repo configs. |
 | `key` | derived | The repository's key in the state DB. |
-| `batch` | `false` | Use batch mode by default. |
-| `pair_check` | `true` | Gate a failing branch alone for diagnosis. See [the pair check](how-it-works.html#the-pair-check). |
-| `lock_wait` | `0` | Seconds to wait for the queue lock; 0 waits indefinitely. |
-| `command_prefix` | `[]` | Wrapper for every gate, hook and conflict command, for example `["sudo", "-u", "ci", "--"]`. See [Isolation](deployment.html#isolation). |
+| `pair_check` | `true` | Gate a failing PR alone for diagnosis. See [the pair check](how-it-works.html#the-pair-check). |
 
 ## [merge]
 
@@ -71,61 +59,34 @@ Braces inside an expanded environment value are kept literally.
 |---|---|---|
 | `no_ff` | `false` | Always create a merge commit. |
 
-## [gate]
+## [ci]
+
+See [Gates](gates.html).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `default` | the only gate | Required with more than one gate. |
-| `timeout` | `7200` | Default timeout for all gates. |
-| `env` | `{}` | Env for all gates. |
-
-## [gates.&lt;name&gt;] {#gates}
-
-Names start with a letter or digit, then letters, digits, `.`, `-`, `_`.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `command` | required | Exit 0 passes, 1 fails, anything else is an [infrastructure failure](gates.html#exit-codes). |
-| `timeout` | `[gate] timeout` | Seconds before the gate is stopped. |
-| `retries` | `1` | Retries after an infrastructure failure. |
-| `retry_wait` | `30` | Seconds between retries. |
-| `env` | `{}` | Added on top of `[gate] env`. |
-| `affected_command` | none | See [Affected tests](gates.html#affected-tests). |
-| `full_when` | `[]` | With `affected_command`: patterns that force a full run. |
-| `full_every` | `0` | With `affected_command`: full run after this many affected landings. Needs records. |
+| `staging` | `"murasame/staging"` | The branch murasame force-pushes merged results to. Not a target branch. |
+| `contexts` | `[]` | Commit status contexts that must pass, such as `"ci / check (push)"`. Empty: every status on the commit except murasame's own. |
+| `timeout` | `7200` | Seconds to wait for a result; then an infrastructure failure. |
+| `start_timeout` | `900` | Seconds to wait for the first status; then an infrastructure failure. At most `timeout`; 0 waits for `timeout`. |
+| `poll_interval` | `15` | Seconds between reads of the statuses. |
 
 ## [[conflicts]]
 
-See [conflict rules](conflicts-and-hooks.html#conflict-rules).
+See [Conflicts](conflicts.html).
 
 | Key | Default | Meaning |
 |---|---|---|
 | `label` | required | Name used in messages. |
 | `paths` | required | Files the rule covers. |
-| `strategy` | required | `keep-both`, `ours`, `theirs`, `command` or `stop`. |
+| `strategy` | required | `keep-both`, `ours`, `theirs` or `stop`. |
 | `exclude` | `[]` | Files to leave out. |
-| `run` | | `command` only: regenerates the files; conflicted paths are appended. |
-| `take` | `"ours"` | `command` only: side checked out before `run`. |
-| `env`, `timeout` | `{}`, `3600` | `command` only. |
-
-## [[hooks.post_merge]] and [[hooks.post_land]]
-
-See [hooks](conflicts-and-hooks.html#post-merge-hooks).
-
-| Key | Default | Meaning |
-|---|---|---|
-| `name` | required | Unique name. |
-| `run` | required | The command. |
-| `env` | `{}` | |
-| `timeout` | `3600` | |
-| `dir` | the repo | Post-land only. Must exist. |
-| `checkout` | `false` | Post-land only. Check `dir` out at the landed commit first. |
 
 ## [records]
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Record passing trees and skip re-gating them. Required by `--no-land` and `full_every`. |
+| `enabled` | `false` | Record trees that passed CI and don't send them to CI again. |
 | `max_age` | `172800` | Seconds a record stays valid. |
 
 ## [forgejo]
@@ -145,13 +106,13 @@ connection keys move to `[instance]` and `[forges.*]`.
 | `status_context` | `"murasame"` | Commit status context. |
 | `batch_max` | `8` | Maximum PRs per batch. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `poll_during_gate` | `30` | Seconds between checks for cancels and pushes during a gate. |
+| `poll_during_gate` | `30` | Seconds between reads of the batch's comments (cancel, unapprove) while waiting on CI. |
 | `listen` | `"127.0.0.1:8737"` | HTTP address. |
 | `webhook_secret_env` | `"MURASAME_WEBHOOK_SECRET"` | Env var holding the webhook secret. |
 | `external_url` | `""` | Public status page URL; its host is allowed along with loopback. |
 | `comment_on_start` | `false` | Comment when a PR's test starts. |
-| `log_excerpt_lines` | `30` | Gate log lines quoted in failure comments. |
-| `mark_merged` | `true` | Mark the PR merged on the forge after landing. |
+| `log_excerpt_lines` | `30` | Gate log lines (the CI statuses) quoted in failure comments. |
+| `mark_merged` | `true` | Mark the PR merged on the forge after landing. Needs the repository's "manually merged" setting. |
 | `infra_backoff` | `300` | Seconds to pause the queue after an infrastructure failure. |
 | `reply_cooldown` | `60` | Minimum seconds between replies to the same non-reviewer. |
 
@@ -160,25 +121,18 @@ connection keys move to `[instance]` and `[forges.*]`.
 ```toml
 [repo]
 target = ["main", "master"]
-create_integ = true
-batch = true
 
 [merge]
 no_ff = true
 
-[gates.check]
-command = ["sh", "-c", "${CHECK_COMMAND:-make check} || exit 1"]
+[ci]
+contexts = ["ci / check (push)"]
 timeout = 3600
 
 [[conflicts]]
 label = "docs"
 paths = ["CHANGELOG.md", "docs/*.md"]
 strategy = "keep-both"
-
-[[hooks.post_merge]]
-name = "toc"
-run = ["make", "toc"]
-timeout = 300
 
 [records]
 enabled = true
